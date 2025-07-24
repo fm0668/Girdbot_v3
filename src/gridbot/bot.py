@@ -116,13 +116,12 @@ class GridBot:
             try:
                 orders = await self.exchange.watch_orders()
                 if orders is None or len(orders) == 0:
-                    print("未返回订单")
                     await asyncio.sleep(0.01)
                     continue
                 for order in orders:
-                    # Check if the order is limit, and closed
-                    print(f"订单 {order['id']} 状态：{order['status']}，成交量：{order['filled']}")
+                    # 只显示已成交的订单
                     if order['status'] == 'closed' and order['type'] == 'limit':
+                        print(f"🎯 订单成交：ID={order['id']}, 价格={order.get('price')}, 数量={order.get('amount')}, 方向={order.get('side')}")
                         this_trade = Trade(
                             order_id=order.get('id'),
                             side=order.get('side'),
@@ -163,6 +162,9 @@ class GridBot:
 
     def _update_stats(self, trade: Optional[Trade] = None):
         """更新并发送统计信息到前端"""
+        # 显示有意义的策略状态信息
+        self._print_strategy_status()
+
         if not self.config.frontend:
             return
 
@@ -181,12 +183,43 @@ class GridBot:
 
     def _calculate_total_profit(self) -> float:
         """计算已完成交易的总利润。新永续合约策略尚未实现准确计算。"""
-        print("警告：新永续合约策略的利润计算尚未实现")
+        # 静默返回，不打印警告
         return 0.0 # Return 0 for now
 
     def _calculate_period_profit(self, hours: int) -> float:
         """计算特定时间段的利润。新永续合约策略尚未实现准确计算。"""
         return 0.0 # Return 0 for now
+
+    def _print_strategy_status(self):
+        """打印有意义的策略状态信息"""
+        try:
+            # 统计网格状态
+            available_count = sum(1 for level in self.strategy.grid_levels.values() if level.status == "AVAILABLE")
+            pending_count = sum(1 for level in self.strategy.grid_levels.values() if level.status == "ORDER_PENDING")
+            position_count = sum(1 for level in self.strategy.grid_levels.values() if level.status == "POSITION_HELD")
+
+            # 计算总网格数
+            total_grids = len(self.strategy.grid_levels)
+
+            # 当前价格
+            current_price = self.current_price if hasattr(self, 'current_price') and self.current_price else "未知"
+
+            # 每30秒打印一次状态（假设_update_stats每秒调用一次）
+            if not hasattr(self, '_status_counter'):
+                self._status_counter = 0
+
+            self._status_counter += 1
+            if self._status_counter >= 30:  # 30秒打印一次
+                print(f"📊 网格状态 | 当前价格: {current_price} | "
+                      f"总网格: {total_grids} | "
+                      f"挂单: {pending_count} | "
+                      f"持仓: {position_count} | "
+                      f"可用: {available_count}")
+                self._status_counter = 0
+
+        except Exception as e:
+            # 静默处理错误，避免干扰主要逻辑
+            pass
 
     async def run(self):
         """Main bot execution loop."""

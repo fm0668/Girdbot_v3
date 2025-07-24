@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from datetime import datetime
 from decimal import Decimal
 from typing import Optional, Dict
 from .models import BotConfig, Trade, GridLevelState
@@ -16,7 +17,8 @@ class GridStrategy:
     def __init__(self, config: BotConfig, exchange: ExchangeInterface):
         self.config = config
         self.exchange = exchange
-        self.grid_levels: Dict[Decimal, GridLevelState] = {}
+        self.grid_levels: Dict[str, GridLevelState] = {}  # 改为以ID为key
+        self.price_to_id: Dict[Decimal, str] = {}  # 价格到ID的映射
         self.state_file_path = f"grid_state_{self.config.name.replace('/', '_')}.json"
         
         # 从配置中获取常用参数，便于快速访问
@@ -42,11 +44,13 @@ class GridStrategy:
 
         await self._place_initial_orders()
 
-        # --- 添加简单延时 ---
-        # 这个延时让机器人有时间处理启动时的大量立即成交订单
-        delay_seconds = 3
+        # --- 添加延时并主动检查立即成交的订单 ---
+        delay_seconds = 5  # 增加到5秒
         print(f"初始订单已提交。等待 {delay_seconds} 秒以处理立即成交的交易...")
         await asyncio.sleep(delay_seconds)
+
+        # 主动检查并处理应该立即成交的订单
+        await self._process_immediate_fills()
         # --------------------------
 
         await self._save_state()
@@ -64,7 +68,71 @@ class GridStrategy:
             if self.side == "short" and price == self.lower_price:
                 continue
 
-            self.grid_levels[price] = GridLevelState(price=price, status="AVAILABLE")
+            # 创建唯一ID
+            grid_id = f"grid_{i:03d}"  # 格式：grid_000, grid_001, etc.
+            level = GridLevelState(id=grid_id, price=price, status="AVAILABLE")
+
+            self.grid_levels[grid_id] = level
+            self.price_to_id[price] = grid_id
+
+    async def _process_immediate_fills(self):
+        """
+        启动网格时，主动为应该立即成交的价格点创建平仓单
+        交易所会将当前价上方的买入限价单瞬间以市价成交并合并为一个持仓
+        但我们需要为每个应该成交的价格点创建对应的平仓单
+        """
+        print("正在处理启动时的立即成交逻辑...")
+
+        # 获取当前市价
+        ticker = await self.exchange.fetch_ticker()
+        current_price = Decimal(str(ticker['last']))
+        print(f"当前市价：{current_price}")
+
+        immediate_fill_count = 0
+
+        for grid_id, level in self.grid_levels.items():
+            if level.status == "ORDER_PENDING":
+                # 判断这个价格点是否应该立即成交
+                should_fill_immediately = False
+
+                if self.side == "long":
+                    # 做多：买入价格高于等于当前市价的订单应该立即成交
+                    should_fill_immediately = level.price >= current_price
+                else:
+                    # 做空：卖出价格低于等于当前市价的订单应该立即成交
+                    # 修正：做空时，卖出价格低于等于当前市价才会立即成交
+                    should_fill_immediately = level.price <= current_price
+
+                if should_fill_immediately:
+                    print(f"🎯 网格 {grid_id}（价格 {level.price}）应该立即成交，直接创建持仓和平仓单")
+
+                    # 直接将状态转换为持仓状态
+                    level.status = "POSITION_HELD"
+                    level.open_order_id = None  # 清除订单ID，因为已经成交
+                    level.position_amount = self.config.order_amount_usdt / level.price  # 计算持仓数量
+
+                    # 为这个价格点创建平仓单
+                    try:
+                        close_price = level.price + self.grid_step if self.side == "long" else level.price - self.grid_step
+                        params = {
+                            'positionSide': 'LONG' if self.side == 'long' else 'SHORT'
+                        }
+
+                        if self.side == "long":
+                            # 平多仓：卖出
+                            order = await self.exchange.create_limit_sell_order(level.position_amount, close_price, params)
+                        else:
+                            # 平空仓：买入
+                            order = await self.exchange.create_limit_buy_order(level.position_amount, close_price, params)
+
+                        level.close_order_id = order['id']
+                        print(f"✅ 为网格 {grid_id}（价格 {level.price}）创建平仓订单 {order['id']}，目标价格 {close_price}")
+                        immediate_fill_count += 1
+
+                    except Exception as e:
+                        print(f"❌ 为网格 {grid_id}（价格 {level.price}）创建平仓订单时出错：{e}")
+
+        print(f"✅ 启动时处理了 {immediate_fill_count} 个应该立即成交的价格点")
 
     async def _sync_order_states(self):
         """重启时同步本地状态与交易所状态"""
@@ -72,7 +140,7 @@ class GridStrategy:
         open_orders = await self.exchange.fetch_open_orders()
         open_order_ids = {o['id'] for o in open_orders}
 
-        for price, level in self.grid_levels.items():
+        for grid_id, level in self.grid_levels.items():
             # Case 1: We think an open order is pending
             if level.status == "ORDER_PENDING" and level.open_order_id:
                 if level.open_order_id not in open_order_ids:
@@ -80,7 +148,7 @@ class GridStrategy:
                     try:
                         order = await self.exchange.fetch_order(level.open_order_id)
                         if order['status'] == 'closed':
-                            print(f"同步：发现已成交的开仓订单 {level.open_order_id}，价格 {price}")
+                            print(f"同步：发现已成交的开仓订单 {level.open_order_id}，网格 {grid_id}（价格 {level.price}）")
                             # Create a Trade object from the order
                             trade = Trade(
                                 order_id=order['id'],
@@ -90,7 +158,7 @@ class GridStrategy:
                             )
                             await self._handle_open_order_fill(level, trade)
                         else: # cancelled or other states
-                            print(f"发现已取消的订单 {level.open_order_id}，价格 {price}")
+                            print(f"发现已取消的订单 {level.open_order_id}，网格 {grid_id}（价格 {level.price}）")
                             level.status = "AVAILABLE"
                             level.open_order_id = None
                     except Exception as e:
@@ -105,7 +173,7 @@ class GridStrategy:
                     try:
                         order = await self.exchange.fetch_order(level.close_order_id)
                         if order['status'] == 'closed':
-                            print(f"同步：发现已成交的平仓订单 {level.close_order_id}，持仓价格 {price}")
+                            print(f"同步：发现已成交的平仓订单 {level.close_order_id}，网格 {grid_id}（价格 {level.price}）")
                             trade = Trade(
                                 order_id=order['id'],
                                 side=order['side'],
@@ -114,7 +182,7 @@ class GridStrategy:
                             )
                             await self._handle_close_order_fill(level, trade)
                         else: # Close order was cancelled, we need to replace it
-                            print(f"同步：价格 {price} 的平仓订单已被取消，正在重新放置")
+                            print(f"同步：网格 {grid_id}（价格 {level.price}）的平仓订单已被取消，正在重新放置")
                             await self._place_close_order_from_sync(level)
                     except Exception as e:
                         print(f"获取平仓订单 {level.close_order_id} 时出错：{e}")
@@ -122,13 +190,13 @@ class GridStrategy:
                         await self._place_close_order_from_sync(level)
                 elif not level.close_order_id:
                     # We hold a position but have no record of a close order. This is a zombie position.
-                    print(f"同步：发现价格 {price} 的僵尸持仓（无平仓订单），正在放置平仓订单")
+                    print(f"同步：发现网格 {grid_id}（价格 {level.price}）的僵尸持仓（无平仓订单），正在放置平仓订单")
                     await self._place_close_order_from_sync(level)
 
     async def _place_close_order_from_sync(self, level: GridLevelState):
         """同步期间为现有持仓放置平仓订单的辅助方法"""
         if not level.position_amount:
-            print(f"错误：无法为价格 {level.price} 放置平仓订单，持仓数量未知")
+            print(f"错误：无法为网格 {level.id}（价格 {level.price}）放置平仓订单，持仓数量未知")
             return # Or fetch position size from exchange
 
         close_price = level.price + self.grid_step if self.side == "long" else level.price - self.grid_step
@@ -143,9 +211,9 @@ class GridStrategy:
                 order = await self.exchange.create_limit_buy_order(level.position_amount, close_price, params)
 
             level.close_order_id = order['id']
-            print(f"同步：为价格 {level.price} 的持仓放置平仓订单 {order['id']}，目标价格 {close_price}")
+            print(f"同步：为网格 {level.id}（价格 {level.price}）的持仓放置平仓订单 {order['id']}，目标价格 {close_price}")
         except Exception as e:
-            print(f"同步时为价格 {level.price} 的持仓放置平仓订单出错：{e}")
+            print(f"同步时为网格 {level.id}（价格 {level.price}）的持仓放置平仓订单出错：{e}")
 
     async def _place_close_order(self, level, filled_order):
         """为已成交的订单放置平仓单"""
@@ -178,10 +246,10 @@ class GridStrategy:
         """
         print("正在放置初始订单以建立网格持仓...")
 
-        for price, level in self.grid_levels.items():
+        for grid_id, level in self.grid_levels.items():
             if level.status == "AVAILABLE":
                 try:
-                    order_amount_coin = self.config.order_amount_usdt / price
+                    order_amount_coin = self.config.order_amount_usdt / level.price
 
                     # --- 关键修改：移除 postOnly 和价格检查 ---
                     params = {
@@ -189,63 +257,80 @@ class GridStrategy:
                     }
 
                     if self.side == "long":
-                        order = await self.exchange.create_limit_buy_order(order_amount_coin, price, params)
+                        order = await self.exchange.create_limit_buy_order(order_amount_coin, level.price, params)
                     else: # short strategy
-                        order = await self.exchange.create_limit_sell_order(order_amount_coin, price, params)
+                        order = await self.exchange.create_limit_sell_order(order_amount_coin, level.price, params)
 
                     # 假设订单处于挂单状态，watch_orders 循环将处理
                     # 立即成交的情况，将状态转换为 POSITION_HELD
                     level.open_order_id = order['id']
                     level.status = "ORDER_PENDING"
-                    print(f"提交开仓{'多头' if self.side == 'long' else '空头'}订单 {order['id']}，价格 {price}")
+                    print(f"提交开仓{'多头' if self.side == 'long' else '空头'}订单 {order['id']}，网格ID {grid_id}，价格 {level.price}")
 
                 except Exception as e:
                     # 价格保护错误仍可能发生，如果网格范围太宽
                     if 'limit price can\'t be higher' in str(e).lower() or 'limit price can\'t be lower' in str(e).lower():
-                        print(f"跳过价格 {price} 的订单：价格超出交易所限制")
+                        print(f"跳过网格 {grid_id}（价格 {level.price}）的订单：价格超出交易所限制")
                     else:
-                        print(f"在价格 {price} 放置初始订单时出错：{e}")
+                        print(f"在网格 {grid_id}（价格 {level.price}）放置初始订单时出错：{e}")
 
     async def handle_filled_order(self, trade: Trade):
         """处理已成交订单的核心状态机逻辑"""
         print(f"--- 处理已成交订单：ID {trade.order_id}，方向 {trade.side}，价格 {trade.price} ---")
 
-        filled_level_price = None
-        # First try to find by order ID
-        for price, level in self.grid_levels.items():
+        found_level = None
+        found_grid_id = None
+
+        # 1. 首先通过订单ID查找
+        for grid_id, level in self.grid_levels.items():
             if level.open_order_id == trade.order_id:
+                print(f"通过订单ID找到开仓订单：网格 {grid_id}")
                 await self._handle_open_order_fill(level, trade)
-                filled_level_price = price
+                found_level = level
+                found_grid_id = grid_id
                 break
             elif level.close_order_id == trade.order_id:
+                print(f"通过订单ID找到平仓订单：网格 {grid_id}")
                 await self._handle_close_order_fill(level, trade)
-                filled_level_price = price
+                found_level = level
+                found_grid_id = grid_id
                 break
 
-        # If not found by order ID, try to find by price (with tolerance)
-        if filled_level_price is None:
+        # 2. 如果订单ID不匹配，通过价格匹配（容错处理）
+        if found_level is None:
             print(f"未找到订单ID {trade.order_id}，尝试通过价格 {trade.price} 匹配")
             tolerance = Decimal('0.0001')  # 0.01% tolerance
-            for price, level in self.grid_levels.items():
-                price_diff = abs(price - trade.price) / price
-                if price_diff <= tolerance and level.status == "ORDER_PENDING":
-                    print(f"通过价格找到匹配的网格层级：{price}（差异：{price_diff:.6f}）")
-                    # Update the order ID and handle the fill
-                    level.open_order_id = trade.order_id
-                    await self._handle_open_order_fill(level, trade)
-                    filled_level_price = price
-                    break
 
-        if filled_level_price is None:
+            for grid_id, level in self.grid_levels.items():
+                price_diff = abs(level.price - trade.price) / level.price
+                if price_diff <= tolerance:
+                    if level.status == "ORDER_PENDING":
+                        print(f"通过价格找到匹配的开仓网格：{grid_id}（价格差异：{price_diff:.6f}）")
+                        # 更新订单ID并处理成交
+                        level.open_order_id = trade.order_id
+                        await self._handle_open_order_fill(level, trade)
+                        found_level = level
+                        found_grid_id = grid_id
+                        break
+                    elif level.status == "POSITION_HELD" and level.close_order_id:
+                        print(f"通过价格找到匹配的平仓网格：{grid_id}（价格差异：{price_diff:.6f}）")
+                        # 更新订单ID并处理成交
+                        level.close_order_id = trade.order_id
+                        await self._handle_close_order_fill(level, trade)
+                        found_level = level
+                        found_grid_id = grid_id
+                        break
+
+        if found_level is None:
             print(f"警告：已成交订单 {trade.order_id}（价格 {trade.price}）不匹配任何已知网格层级，忽略处理")
             return
 
         await self._save_state()
-        print("--- 订单处理完成 ---")
+        print(f"--- 网格 {found_grid_id} 订单处理完成 ---")
 
     async def _handle_open_order_fill(self, level: GridLevelState, trade: Trade):
         """处理开仓订单成交的逻辑"""
-        print(f"开仓订单在价格 {level.price} 成交，转换为持仓状态")
+        print(f"网格 {level.id} 开仓订单在价格 {level.price} 成交，转换为持仓状态")
 
         # 1. Update state
         level.status = "POSITION_HELD"
@@ -278,10 +363,10 @@ class GridStrategy:
                 order = await self.exchange.create_limit_buy_order(trade.amount, close_price, params)
                 
             level.close_order_id = order['id']
-            print(f"为价格 {level.price} 的持仓放置平仓订单 {order['id']}，目标价格 {close_price}")
+            print(f"✅ 为网格 {level.id}（价格 {level.price}）的持仓放置平仓订单 {order['id']}，目标价格 {close_price}")
 
         except Exception as e:
-            print(f"为价格 {level.price} 的持仓放置平仓订单时出错：{e}")
+            print(f"❌ 为网格 {level.id}（价格 {level.price}）的持仓放置平仓订单时出错：{e}")
             # In a real scenario, you'd need a retry mechanism or alert.
 
     async def _handle_close_order_fill(self, level: GridLevelState, trade: Trade):
@@ -349,8 +434,11 @@ class GridStrategy:
     async def _save_state(self):
         """将当前网格状态保存到文件"""
         try:
-            # Pydantic's built-in json() method handles Decimal serialization correctly
-            state_to_save = {str(k): json.loads(v.json()) for k, v in self.grid_levels.items()}
+            # 保存网格状态和价格映射
+            state_to_save = {
+                'grid_levels': {grid_id: json.loads(level.json()) for grid_id, level in self.grid_levels.items()},
+                'price_to_id': {str(price): grid_id for price, grid_id in self.price_to_id.items()}
+            }
             with open(self.state_file_path, 'w') as f:
                 json.dump(state_to_save, f, indent=4)
         except Exception as e:
@@ -361,13 +449,25 @@ class GridStrategy:
         try:
             with open(self.state_file_path, 'r') as f:
                 loaded_state = json.load(f)
+
+                # 加载网格层级
                 self.grid_levels = {
-                    Decimal(k): GridLevelState(**v) for k, v in loaded_state.items()
+                    grid_id: GridLevelState(**level_data)
+                    for grid_id, level_data in loaded_state.get('grid_levels', {}).items()
                 }
+
+                # 加载价格映射
+                self.price_to_id = {
+                    Decimal(price_str): grid_id
+                    for price_str, grid_id in loaded_state.get('price_to_id', {}).items()
+                }
+
                 print(f"成功加载 {len(self.grid_levels)} 个网格层级的状态")
         except FileNotFoundError:
             print("未找到状态文件，全新开始")
             self.grid_levels = {}
+            self.price_to_id = {}
         except Exception as e:
             print(f"加载状态时出错：{e}")
             self.grid_levels = {}
+            self.price_to_id = {}

@@ -104,6 +104,7 @@ class Trade(BaseModel):
 
 # 建议新增一个状态模型，用于新的策略逻辑
 class GridLevelState(BaseModel):
+    id: str  # 唯一标识符，格式如 "grid_001", "grid_002"
     price: Decimal
     status: Literal["AVAILABLE", "ORDER_PENDING", "POSITION_HELD"]
     open_order_id: Optional[str] = None
