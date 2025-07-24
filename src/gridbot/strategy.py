@@ -149,13 +149,17 @@ class GridStrategy:
                         order = await self.exchange.fetch_order(level.open_order_id)
                         if order['status'] == 'closed':
                             print(f"同步：发现已成交的开仓订单 {level.open_order_id}，网格 {grid_id}（价格 {level.price}）")
-                            # Create a Trade object from the order
-                            trade = Trade(
-                                order_id=order['id'],
-                                side=order['side'],
-                                amount=order['amount'],
-                                price=Decimal(str(order['price']))
-                            )
+                            # 使用更精确的字段创建Trade对象
+                            trade_data = {
+                                'order_id': order.get('id'),
+                                'side': order.get('side'),
+                                'symbol': order.get('symbol', self.config.pair),
+                                'price': Decimal(str(order.get('average', order.get('price')))),  # average更精确
+                                'amount': Decimal(str(order.get('filled', order.get('amount')))),  # filled更精确
+                                'cost': Decimal(str(order.get('cost', '0'))),
+                                'timestamp': int(order.get('timestamp') or datetime.now().timestamp() * 1000)
+                            }
+                            trade = Trade(**trade_data)
                             await self._handle_open_order_fill(level, trade)
                         else: # cancelled or other states
                             print(f"发现已取消的订单 {level.open_order_id}，网格 {grid_id}（价格 {level.price}）")
@@ -174,12 +178,17 @@ class GridStrategy:
                         order = await self.exchange.fetch_order(level.close_order_id)
                         if order['status'] == 'closed':
                             print(f"同步：发现已成交的平仓订单 {level.close_order_id}，网格 {grid_id}（价格 {level.price}）")
-                            trade = Trade(
-                                order_id=order['id'],
-                                side=order['side'],
-                                amount=order['amount'],
-                                price=Decimal(str(order['price']))
-                            )
+                            # 使用更精确的字段创建Trade对象
+                            trade_data = {
+                                'order_id': order.get('id'),
+                                'side': order.get('side'),
+                                'symbol': order.get('symbol', self.config.pair),
+                                'price': Decimal(str(order.get('average', order.get('price')))),  # average更精确
+                                'amount': Decimal(str(order.get('filled', order.get('amount')))),  # filled更精确
+                                'cost': Decimal(str(order.get('cost', '0'))),
+                                'timestamp': int(order.get('timestamp') or datetime.now().timestamp() * 1000)
+                            }
+                            trade = Trade(**trade_data)
                             await self._handle_close_order_fill(level, trade)
                         else: # Close order was cancelled, we need to replace it
                             print(f"同步：网格 {grid_id}（价格 {level.price}）的平仓订单已被取消，正在重新放置")
@@ -404,21 +413,88 @@ class GridStrategy:
 
     async def _cleanup_exchange_state(self):
         """关闭所有持仓并取消该交易对的所有订单"""
+        pair = self.config.pair
+        print(f"--- 开始清理 {pair} 的所有状态 ---")
         try:
-            # This is a simplified cleanup. A robust version would fetch positions first.
-            # For now, we assume we need to close a position if we have one.
-            # A better implementation would be in exchange.py
-            print("正在关闭所有开放持仓...")
-            # This logic needs to be robust, check current position side and size
-            # For now, let's just try to close both ways if needed, or implement in exchange.py
-
+            # 1. 首先取消所有挂单，防止新的成交
             print("正在取消所有挂单...")
             open_orders = await self.exchange.fetch_open_orders()
+            print(f"获取到 {len(open_orders)} 个挂单")
+
+            # 显示挂单详情（调试用）
+            for order in open_orders:
+                symbol = order.get('symbol', '')
+                order_id = order.get('id', '')
+                side = order.get('side', '')
+                amount = order.get('amount', 0)
+                price = order.get('price', 0)
+                print(f"挂单详情：{symbol} | ID={order_id} | {side} | 数量={amount} | 价格={price}")
+
             for order in open_orders:
                 await self.exchange.cancel_order(order['id'])
             print(f"已取消 {len(open_orders)} 个订单")
+
+            # 2. 获取并平掉所有该交易对的持仓
+            print("正在获取开放持仓...")
+            positions = await self.exchange.fetch_positions([pair])
+            print(f"获取到 {len(positions)} 个持仓记录")
+
+            # 过滤出当前交易对的持仓
+            target_positions = []
+            for position in positions:
+                symbol = position.get('symbol', '')
+                contracts = Decimal(str(position.get('contracts', '0')))
+
+                # 调试信息
+                print(f"检查持仓：交易对={symbol}, 数量={contracts}")
+
+                # 只处理当前交易对且数量大于0的持仓
+                # 处理不同的symbol格式：DOGE/USDC 或 DOGE/USDC:USDC
+                if (symbol == pair or symbol.startswith(pair)) and contracts > 0:
+                    target_positions.append(position)
+
+            print(f"找到 {len(target_positions)} 个需要平仓的 {pair} 持仓")
+
+            for position in target_positions:
+                contracts = Decimal(str(position.get('contracts', '0')))
+                side = position.get('side')  # 'long' or 'short'
+                print(f"发现开放的{side}持仓：{contracts} {self.config.coin}，正在平仓...")
+
+                # 对冲模式下，必须指定要平掉哪一边的持仓
+                params = {'positionSide': side.upper()}  # 'LONG' or 'SHORT'
+
+                # 使用修复后的平仓方法
+                await self.exchange.create_market_close_order(pair, side, contracts, params)
+                print(f"已提交市价单平掉{side}持仓")
+
+                # 等待平仓完成
+                await asyncio.sleep(1)  # 给交易所时间处理平仓
+
+            # 验证清理结果
+            print("正在验证清理结果...")
+            await asyncio.sleep(2)  # 等待交易所更新状态
+
+            # 再次检查持仓
+            final_positions = await self.exchange.fetch_positions([pair])
+            remaining_positions = []
+            for position in final_positions:
+                symbol = position.get('symbol', '')
+                contracts = Decimal(str(position.get('contracts', '0')))
+                if (symbol == pair or symbol.startswith(pair)) and contracts > 0:
+                    remaining_positions.append(position)
+
+            if remaining_positions:
+                print(f"⚠️ 警告：仍有 {len(remaining_positions)} 个持仓未完全清理")
+                for pos in remaining_positions:
+                    side = pos.get('side')
+                    contracts = Decimal(str(pos.get('contracts', '0')))
+                    print(f"  剩余持仓：{side} {contracts} {self.config.coin}")
+            else:
+                print("✅ 所有持仓已成功清理")
+
+            print(f"--- {pair} 状态清理完成 ---")
         except Exception as e:
-            print(f"清理过程中出错：{e}")
+            print(f"清理交易所状态时出错：{e}")
 
     async def check_order_health(self):
         """定期与交易所同步状态"""

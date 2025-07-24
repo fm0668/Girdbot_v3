@@ -260,9 +260,29 @@ class GridBot:
 
     async def _cleanup(self):
         """Cleanup resources on shutdown."""
-        if self.config.frontend:
-            await self.ws_manager.close()
-        await self.exchange.close()
+        print("\n🛑 正在执行优雅退出清理...")
+
+        # 清理交易所状态（挂单和持仓）
+        try:
+            if hasattr(self, 'strategy') and self.strategy:
+                print("📋 正在清理所有挂单和持仓...")
+                await self.strategy._cleanup_exchange_state()
+                print("✅ 交易所状态清理完成")
+            else:
+                print("⚠️ 策略未初始化，跳过交易所清理")
+        except Exception as e:
+            print(f"❌ 清理交易所状态时出错：{e}")
+
+        # 关闭WebSocket和交易所连接
+        try:
+            if self.config.frontend:
+                await self.ws_manager.close()
+            await self.exchange.close()
+            print("🔌 连接已关闭")
+        except Exception as e:
+            print(f"❌ 关闭连接时出错：{e}")
+
+        print("✅ 优雅退出完成")
 
 
 def main():

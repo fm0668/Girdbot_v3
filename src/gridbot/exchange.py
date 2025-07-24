@@ -129,6 +129,26 @@ class ExchangeInterface:
             print(f"监控订单时出错：{e}")
             return []
 
+    async def fetch_positions(self, symbols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """获取所有开放持仓"""
+        return await self.exchange.fetch_positions(symbols)
+
+    async def create_market_close_order(self, symbol: str, position_side: str, amount: Decimal, params: Dict[str, Any] = {}):
+        """创建市价单来平仓
+        Args:
+            symbol: 交易对
+            position_side: 持仓方向 ('long' 或 'short')
+            amount: 持仓数量
+            params: 额外参数，应包含 positionSide
+        """
+        # 平仓时，我们在相反方向创建订单
+        if position_side.lower() == 'long':
+            # 平多仓：卖出
+            return await self.exchange.create_market_sell_order(symbol, float(amount), params)
+        else:
+            # 平空仓：买入
+            return await self.exchange.create_market_buy_order(symbol, float(amount), params)
+
     async def close(self):
         """Close exchange connection."""
         await self.exchange.close()

@@ -38,6 +38,12 @@ config/sandbox*.json
 *.env
 order_pairs_*.json
 
+# Runtime files
+grid_state_*.json
+completed_trades_*.json
+session_context.json
+Session.vim
+
 # Logs
 *.log
 logs/
