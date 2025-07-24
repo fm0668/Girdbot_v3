@@ -532,9 +532,29 @@ class GridStrategy:
             else:
                 print("✅ 所有持仓已成功清理")
 
+            # 🔧 关键修复：清理交易所状态后，删除本地状态文件确保下次启动干净
+            print("�️ 删除本地状态文件，确保下次启动状态一致...")
+            await self._cleanup_local_state_files()
+
             print(f"--- {pair} 状态清理完成 ---")
         except Exception as e:
             print(f"清理交易所状态时出错：{e}")
+
+    async def _cleanup_local_state_files(self):
+        """清理交易所状态后，删除本地状态文件"""
+        try:
+            import os
+
+            # 删除状态文件
+            if os.path.exists(self.state_file_path):
+                os.remove(self.state_file_path)
+                print(f"✅ 已删除状态文件：{self.state_file_path}")
+
+            # 保留利润记录文件，因为它记录的是历史数据
+            print("💰 保留利润记录文件，维持交易历史连续性")
+
+        except Exception as e:
+            print(f"清理本地状态文件时出错：{e}")
 
     async def check_order_health(self):
         """定期与交易所同步状态"""
