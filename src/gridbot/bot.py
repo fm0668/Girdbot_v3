@@ -52,9 +52,9 @@ class GridBot:
         return BotConfig(**config_data)
 
     def _setup_signal_handlers(self):
-        """Setup handlers for graceful shutdown."""
+        """设置优雅关闭的信号处理器"""
         def handle_signal(signum, frame):
-            print("\nReceived shutdown signal. Cleaning up...")
+            print("\n收到关闭信号，正在清理...")
             self.running = False
             self._cancel_tasks()
 
@@ -73,7 +73,7 @@ class GridBot:
 
         self.exchange.balance = await self.exchange.fetch_balance()
         # Note: Balance check might need to be more specific for futures (e.g., check USDT or BUSD)
-        print(f"Initial Balance Info: {self.exchange.balance['info']}")
+        print(f"初始余额信息：{self.exchange.balance['info']}")
 
         # Initialize WebSocket connection
         if self.config.frontend:
@@ -102,26 +102,26 @@ class GridBot:
                     amount = (self.config.fee_coin.repurchase_amount / fee_coin_price)
 
                     await self.exchange.create_market_buy_order(amount)
-                    print(f"Topped up {self.config.fee_coin.coin}")
+                    print(f"已充值 {self.config.fee_coin.coin}")
 
             except Exception as e:
-                print(f"Fee coin management error: {e}")
+                print(f"手续费币种管理错误：{e}")
 
             # Random delay to avoid multiple bots buying simultaneously
             await asyncio.sleep(60 + (hash(self.config.name) % 180))
 
     async def _watch_orders(self):
-        """Monitor and handle completed orders."""
+        """监控和处理已完成的订单"""
         while self.running:
             try:
                 orders = await self.exchange.watch_orders()
                 if orders is None or len(orders) == 0:
-                    print("No orders returned")
+                    print("未返回订单")
                     await asyncio.sleep(0.01)
                     continue
                 for order in orders:
                     # Check if the order is limit, and closed
-                    print(f"Order {order['id']} status: {order['status']}, filled: {order['filled']}")
+                    print(f"订单 {order['id']} 状态：{order['status']}，成交量：{order['filled']}")
                     if order['status'] == 'closed' and order['type'] == 'limit':
                         this_trade = Trade(
                             order_id=order['id'],
@@ -135,11 +135,11 @@ class GridBot:
                         await self.strategy.handle_filled_order(this_trade)
                         self._update_stats()
             except Exception as e:
-                print(f"Order watching error: {e}")
+                print(f"订单监控错误：{e}")
                 await asyncio.sleep(5)  # Add a delay before retrying
 
     async def _watch_ticker(self):
-        """Monitor and handle ticker updates."""
+        """监控和处理价格更新"""
         while self.running:
             try:
                 ticker = await self.exchange.watch_ticker()
@@ -150,19 +150,19 @@ class GridBot:
                     self.ws_manager.add_price(self.current_price)
                     self._update_stats()
             except Exception as e:
-                print(f"Ticker watching error: {e}")
+                print(f"价格监控错误：{e}")
 
     async def _monitor_health(self):
-        """Periodic health check of orders."""
+        """定期检查订单健康状态"""
         while self.running:
             await asyncio.sleep(60)
             try:
                 await self.strategy.check_order_health()
             except Exception as e:
-                print(f"Health check error: {e}")
+                print(f"健康检查错误：{e}")
 
     def _update_stats(self, trade: Optional[Trade] = None):
-        """Update and send statistics to frontend."""
+        """更新并发送统计信息到前端"""
         if not self.config.frontend:
             return
 
@@ -180,12 +180,12 @@ class GridBot:
             self.ws_manager.send_update('stats', {}, stats)
 
     def _calculate_total_profit(self) -> float:
-        """Calculate total profit from completed trades. NOT ACCURATE FOR NEW STRATEGY."""
-        print("Warning: Profit calculation is not implemented for the new perpetuals strategy.")
+        """计算已完成交易的总利润。新永续合约策略尚未实现准确计算。"""
+        print("警告：新永续合约策略的利润计算尚未实现")
         return 0.0 # Return 0 for now
 
     def _calculate_period_profit(self, hours: int) -> float:
-        """Calculate profit for a specific time period. NOT ACCURATE FOR NEW STRATEGY."""
+        """计算特定时间段的利润。新永续合约策略尚未实现准确计算。"""
         return 0.0 # Return 0 for now
 
     async def run(self):
@@ -213,9 +213,9 @@ class GridBot:
                 # Wait for all tasks to complete or be cancelled
                 await asyncio.gather(*self.tasks)
             except asyncio.CancelledError:
-                print("Tasks were cancelled.")
+                print("任务已被取消")
         except Exception as e:
-            print(f"Bot execution error: {e}")
+            print(f"机器人执行错误：{e}")
         finally:
             self.running = False
             await self._cleanup()

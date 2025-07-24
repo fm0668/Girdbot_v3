@@ -35,32 +35,32 @@ class ExchangeInterface:
         self.markets = await self.exchange.fetch_markets()
 
     async def set_leverage_and_margin_mode(self):
-        """Set leverage and margin mode for the trading pair."""
+        """为交易对设置杠杆和保证金模式"""
         try:
-            print(f"Setting up for perpetuals market: {self.config.pair}")
+            print(f"正在设置永续合约市场：{self.config.pair}")
 
             # 设置持仓模式为双向持仓
             try:
                 await self.exchange.set_position_mode(True)  # True = 双向持仓模式
-                print("Position mode set to Hedge (Two-way).")
+                print("持仓模式已设置为双向持仓")
             except Exception as e:
-                print(f"Position mode setting failed (may already be set): {e}")
+                print(f"持仓模式设置失败（可能已经设置）：{e}")
 
             # CCXT统一方法设置保证金模式为 ISOLATED (逐仓)
             await self.exchange.set_margin_mode('ISOLATED', self.config.pair)
-            print(f"Margin mode for {self.config.pair} set to ISOLATED.")
+            print(f"{self.config.pair} 的保证金模式已设置为逐仓")
 
             # CCXT统一方法设置杠杆
             await self.exchange.set_leverage(self.config.leverage, self.config.pair)
-            print(f"Leverage for {self.config.pair} set to {self.config.leverage}x.")
+            print(f"{self.config.pair} 的杠杆已设置为 {self.config.leverage}x")
 
         except Exception as e:
-            print(f"FATAL: Failed to set leverage or margin mode. Error: {e}")
+            print(f"致命错误：设置杠杆或保证金模式失败。错误：{e}")
             # 在真实应用中，这里应该抛出异常，让程序停止
             raise e
 
     async def fetch_ticker(self, symbol: Optional[str] = None) -> Dict[str, Any]:
-        """Fetch current ticker information."""
+        """获取当前价格信息"""
         symbol = symbol or self.config.pair
         ticker = await self.exchange.fetch_ticker(symbol)
         self.current_price = Decimal(str(ticker['last']))
@@ -126,7 +126,7 @@ class ExchangeInterface:
             return orders
 
         except Exception as e:
-            print(f"Error in watch_orders: {e}")
+            print(f"监控订单时出错：{e}")
             return []
 
     async def close(self):
