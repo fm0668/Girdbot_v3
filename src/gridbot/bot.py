@@ -130,7 +130,7 @@ class GridBot:
                             price=Decimal(str(order.get('price'))),
                             amount=Decimal(str(order.get('amount'))),
                             cost=Decimal(str(order.get('cost', '0'))), # 默认成本为0
-                            timestamp=int(order.get('timestamp', datetime.now().timestamp() * 1000))
+                            timestamp=int(order.get('timestamp') or datetime.now().timestamp() * 1000)
                         )
                         await self.strategy.handle_filled_order(this_trade)
                         self._update_stats()
