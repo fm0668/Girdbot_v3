@@ -124,13 +124,13 @@ class GridBot:
                     print(f"订单 {order['id']} 状态：{order['status']}，成交量：{order['filled']}")
                     if order['status'] == 'closed' and order['type'] == 'limit':
                         this_trade = Trade(
-                            order_id=order['id'],
-                            side=order['side'],
-                            symbol=self.config.pair,
-                            price=Decimal(str(order['price'])),
-                            amount=Decimal(str(order['amount'])),
-                            cost=Decimal(str(order['cost'])),
-                            timestamp=int(order['timestamp']) if order['timestamp'] is not None else int(datetime.now().timestamp() * 1000)
+                            order_id=order.get('id'),
+                            side=order.get('side'),
+                            symbol=order.get('symbol', self.config.pair), # 使用配置中的交易对作为默认值
+                            price=Decimal(str(order.get('price'))),
+                            amount=Decimal(str(order.get('amount'))),
+                            cost=Decimal(str(order.get('cost', '0'))), # 默认成本为0
+                            timestamp=int(order.get('timestamp', datetime.now().timestamp() * 1000))
                         )
                         await self.strategy.handle_filled_order(this_trade)
                         self._update_stats()

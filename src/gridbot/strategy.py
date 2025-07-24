@@ -1,14 +1,15 @@
 # strategy.py
 
+import asyncio
+import json
 from decimal import Decimal
 from typing import Optional, Dict
 from .models import BotConfig, Trade, GridLevelState
 from .exchange import ExchangeInterface
-import json
 
 class GridStrategy:
     """
-    实现永续合约的"单向接力网格"策略
+    实现永续合约
     使用状态机方法管理网格交易
     """
 
@@ -40,6 +41,14 @@ class GridStrategy:
             await self._sync_order_states()
 
         await self._place_initial_orders()
+
+        # --- 添加简单延时 ---
+        # 这个延时让机器人有时间处理启动时的大量立即成交订单
+        delay_seconds = 3
+        print(f"初始订单已提交。等待 {delay_seconds} 秒以处理立即成交的交易...")
+        await asyncio.sleep(delay_seconds)
+        # --------------------------
+
         await self._save_state()
         print("网格策略初始化成功。")
 
@@ -163,60 +172,36 @@ class GridStrategy:
             print(f"为价格 {level.price} 的持仓放置平仓订单时出错：{e}")
 
     async def _place_initial_orders(self):
-        """为所有处于'AVAILABLE'状态的网格层级放置开仓订单"""
-        print("正在放置初始订单...")
-
-        # 获取当前市场价格
-        ticker = await self.exchange.fetch_ticker()
-        current_price = Decimal(str(ticker['last']))
-        print(f"当前市场价格：{current_price}")
+        """
+        为所有网格层级放置开仓订单
+        高于当前市价的订单将立即成交，建立初始持仓
+        """
+        print("正在放置初始订单以建立网格持仓...")
 
         for price, level in self.grid_levels.items():
             if level.status == "AVAILABLE":
                 try:
                     order_amount_coin = self.config.order_amount_usdt / price
 
-                    # --- KEY CHANGE HERE ---
+                    # --- 关键修改：移除 postOnly 和价格检查 ---
                     params = {
-                        'positionSide': 'LONG' if self.side == 'long' else 'SHORT',
-                        'postOnly': True  # Ensure it's a MAKER order
+                        'positionSide': 'LONG' if self.side == 'long' else 'SHORT'
                     }
 
-                    # 做多策略：在所有网格价格都放置买入挂单
                     if self.side == "long":
-                        # 跳过与当前价格太接近的层级，避免立即成交
-                        price_diff = abs(price - current_price) / current_price
-                        if price_diff < Decimal('0.001'):  # 0.1%以内跳过
-                            print(f"跳过价格 {price} 的订单（与当前价格 {current_price} 太接近）")
-                            continue
-
-                        # 在所有其他价格放置买入挂单
                         order = await self.exchange.create_limit_buy_order(order_amount_coin, price, params)
-                        level.open_order_id = order['id']
-                        level.status = "ORDER_PENDING"
-                        position = "低于" if price < current_price else "高于"
-                        print(f"在价格 {price} 放置买入订单 {order['id']}（{position}当前价格）")
-
                     else: # short strategy
-                        # 做空策略：在所有网格价格都放置卖出挂单
-                        price_diff = abs(price - current_price) / current_price
-                        if price_diff < Decimal('0.001'):  # 0.1%以内跳过
-                            print(f"跳过价格 {price} 的订单（与当前价格 {current_price} 太接近）")
-                            continue
-
                         order = await self.exchange.create_limit_sell_order(order_amount_coin, price, params)
-                        level.open_order_id = order['id']
-                        level.status = "ORDER_PENDING"
-                        position = "低于" if price < current_price else "高于"
-                        print(f"在价格 {price} 放置卖出订单 {order['id']}（{position}当前价格）")
+
+                    # 假设订单处于挂单状态，watch_orders 循环将处理
+                    # 立即成交的情况，将状态转换为 POSITION_HELD
+                    level.open_order_id = order['id']
+                    level.status = "ORDER_PENDING"
+                    print(f"提交开仓{'多头' if self.side == 'long' else '空头'}订单 {order['id']}，价格 {price}")
 
                 except Exception as e:
-                    # postOnly订单如果会立即成交，会抛出 OrderImmediatelyFillable 或 Cancelled 错误，这是正常的
-                    if ('postonly' in str(e).lower() or 'immediately' in str(e).lower() or
-                        'would immediately match' in str(e).lower() or 'post only order will be rejected' in str(e).lower() or
-                        'could not be executed as maker' in str(e).lower()):
-                        print(f"跳过价格 {price} 的订单：会立即成交（高于当前市价的价格预期行为）")
-                    elif 'limit price can\'t be higher' in str(e).lower() or 'limit price can\'t be lower' in str(e).lower():
+                    # 价格保护错误仍可能发生，如果网格范围太宽
+                    if 'limit price can\'t be higher' in str(e).lower() or 'limit price can\'t be lower' in str(e).lower():
                         print(f"跳过价格 {price} 的订单：价格超出交易所限制")
                     else:
                         print(f"在价格 {price} 放置初始订单时出错：{e}")
@@ -312,10 +297,9 @@ class GridStrategy:
         try:
             order_amount_coin = self.config.order_amount_usdt / level.price
 
-            # --- KEY CHANGE HERE ---
+            # --- 关键修改：移除 postOnly ---
             params = {
-                'positionSide': 'LONG' if self.side == 'long' else 'SHORT',
-                'postOnly': True # Also for re-placing orders
+                'positionSide': 'LONG' if self.side == 'long' else 'SHORT'
             }
 
             if self.side == "long":
@@ -327,9 +311,9 @@ class GridStrategy:
             level.status = "ORDER_PENDING"
             print(f"在价格 {level.price} 重新放置开仓订单 {order['id']}")
         except Exception as e:
-            # postOnly订单如果会立即成交，会抛出异常，这是正常的
-            if 'postonly' in str(e).lower() or 'immediately' in str(e).lower() or 'would immediately match' in str(e).lower():
-                print(f"跳过在价格 {level.price} 重新放置订单：会立即成交")
+            # 价格保护错误仍可能发生
+            if 'limit price can\'t be higher' in str(e).lower() or 'limit price can\'t be lower' in str(e).lower():
+                print(f"跳过在价格 {level.price} 重新放置订单：价格超出交易所限制")
             else:
                 print(f"在价格 {level.price} 重新放置开仓订单时出错：{e}")
 
