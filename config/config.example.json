@@ -1,17 +1,21 @@
 {
-    "name": "MyGridBot",
+    "name": "PerpetualGridBot-Long",
     "exchange": "binance",
-    "api_key": "your-api-key",
-    "api_secret": "your-api-secret",
-    "pair": "BTC/USDT",
-    "investment": 1000,
-    "grids": 10,
-    "gridsize": 1.0,
+    "api_key": "your-futures-api-key",
+    "api_secret": "your-futures-api-secret",
     "sandbox_mode": true,
+
+    "market_type": "future",
+    "pair": "BTC/USDT",
+
+    "strategy_side": "long",
+    "leverage": 10,
+    "lower_price": "60000",
+    "upper_price": "70000",
+    "grids": 10,
+    "order_amount_usdt": 100,
+    "max_position_count": 5,
+
     "frontend": true,
-    "frontend_host": "localhost:8080",
-    "manage_fee_coin": true,
-    "fee_coin": "BNB",
-    "fee_coin_repurchase_balance_USDT": 10,
-    "fee_coin_repurchase_amount_USDT": 20
+    "frontend_host": "localhost:8080"
 }

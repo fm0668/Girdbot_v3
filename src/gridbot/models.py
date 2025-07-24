@@ -16,58 +16,44 @@ class BotConfig(BaseModel):
     exchange: str
     api_key: str
     api_secret: str
-    pair: str
-    coin: str
-    investment: Decimal = Field(gt=0)
-    grids: int = Field(gt=0)
-    gridsize: Decimal = Field(gt=0)
     sandbox_mode: bool
+
+    # -- Market & Pair --
+    market_type: Literal["spot", "future"] = "future"
+    pair: str
+
+    # -- Strategy Params --
+    strategy_side: Literal["long", "short"]
+    leverage: int = Field(gt=0)
+    lower_price: Decimal = Field(gt=0)
+    upper_price: Decimal = Field(gt=0)
+    grids: int = Field(gt=0)
+    order_amount_usdt: Decimal = Field(gt=0)
+
+    # -- Risk Management --
+    max_position_count: int = Field(gt=0)
+
+    # -- Misc --
     frontend: bool
     frontend_host: str
-    fee_coin: Optional[FeeCoinConfig] = None
 
+    # -- Derived Properties --
+    @property
+    def coin(self) -> str:
+        return self.pair.split('/')[0]
+
+    @property
+    def grid_step(self) -> Decimal:
+        """Calculate the price difference between each grid level."""
+        return (self.upper_price - self.lower_price) / (self.grids - 1)
+
+    # from_env 方法需要完全重写或暂时移除，因为它基于旧的配置
+    # 为简化起见，我们暂时依赖json文件加载
     @classmethod
     def from_env(cls):
-        pair = os.getenv("GRIDBOT_PAIR", "BTC/USDT")
-        coin = pair.split("/")[0]
-        # Helper function to safely convert to Decimal
-
-        def safe_decimal(value, default):
-            try:
-                return Decimal(value) if value is not None else Decimal(default)
-            except InvalidOperation:
-                return Decimal(default)
-
-        return cls(
-            name=os.getenv("GRIDBOT_NAME", "MyGridBot"),
-            exchange=os.getenv("GRIDBOT_EXCHANGE", "binance"),
-            api_key=os.getenv("GRIDBOT_API_KEY", "my_api_key"),
-            api_secret=os.getenv("GRIDBOT_API_SECRET", "my_api_secret"),
-            pair=pair,
-            coin=coin,
-            investment=safe_decimal(os.getenv("GRIDBOT_INVESTMENT"), "1000"),
-            grids=int(os.getenv("GRIDBOT_GRIDS", "10")),
-            gridsize=safe_decimal(os.getenv("GRIDBOT_GRIDSIZE"), "1.0"),
-            sandbox_mode=os.getenv("GRIDBOT_SANDBOX_MODE", "true").lower() == "true",
-            frontend=os.getenv("GRIDBOT_FRONTEND", "true").lower() == "true",
-            frontend_host=os.getenv("GRIDBOT_FRONTEND_HOST", "localhost:8080"),
-            fee_coin=FeeCoinConfig(
-                manage_fee_coin=os.getenv("GRIDBOT_MANAGE_FEE_COIN", "true").lower() == "true",
-                fee_coin=os.getenv("GRIDBOT_FEE_COIN", "BNB"),
-                fee_coin_repurchase_balance_USDT=safe_decimal(os.getenv("GRIDBOT_FEE_COIN_REPURCHASE_BALANCE"), "10"),
-                fee_coin_repurchase_amount_USDT=safe_decimal(os.getenv("GRIDBOT_FEE_COIN_REPURCHASE_AMOUNT"), "20")
-            )
-        )
-
-    @property
-    def quote_per_trade(self) -> Decimal:
-        """Calculate the quote currency amount per trade."""
-        return self.investment / self.grids
-
-    @property
-    def grid_size_percent(self) -> Decimal:
-        """Convert grid size to percentage."""
-        return self.gridsize / 100
+        # This method needs a complete rewrite to support new env vars.
+        # For now, we will rely on the JSON config file.
+        raise NotImplementedError("from_env is not configured for the new perpetuals strategy.")
 
 
 class OrderPair(BaseModel):
@@ -114,3 +100,12 @@ class Trade(BaseModel):
     price: Decimal = Field(gt=0)
     cost: Decimal = Field(gt=0)
     timestamp: int = Field(gt=0)
+
+
+# 建议新增一个状态模型，用于新的策略逻辑
+class GridLevelState(BaseModel):
+    price: Decimal
+    status: Literal["AVAILABLE", "ORDER_PENDING", "POSITION_HELD"]
+    open_order_id: Optional[str] = None
+    close_order_id: Optional[str] = None
+    position_amount: Optional[Decimal] = None

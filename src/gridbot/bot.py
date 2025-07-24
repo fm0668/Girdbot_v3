@@ -1,9 +1,12 @@
 import asyncio
 import json
 import signal
+import os
+import re
 from typing import Optional
 from decimal import Decimal
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 
 from .models import BotConfig, Trade
 from .exchange import ExchangeInterface
@@ -26,14 +29,27 @@ class GridBot:
 
     @staticmethod
     def _load_config(config_path: Optional[str] = None) -> BotConfig:
-        """Load and validate configuration from JSON file or from environment variables"""
-        if config_path:
-            with open(config_path, 'r') as f:
-                config_data = json.load(f)
-                config_data['coin'] = config_data['pair'].split('/')[0]
-            return BotConfig(**config_data)
-        else:
+        """Load and validate configuration from JSON file with environment variable substitution"""
+        load_dotenv()
+
+        if not config_path:
             return BotConfig.from_env()
+
+        with open(config_path, 'r') as f:
+            config_content = f.read()
+
+        def replace_env_vars(match):
+            env_var = match.group(1)
+            value = os.getenv(env_var)
+            if value is None:
+                raise ValueError(f"Environment variable {env_var} not found.")
+            return value
+
+        config_content = re.sub(r'\$\{([^}]+)\}', replace_env_vars, config_content)
+        config_data = json.loads(config_content)
+
+        # Let Pydantic handle all type conversions and validation
+        return BotConfig(**config_data)
 
     def _setup_signal_handlers(self):
         """Setup handlers for graceful shutdown."""
@@ -49,8 +65,15 @@ class GridBot:
         """Initialize bot components."""
         # Initialize exchange
         await self.exchange.initialize()
+
+        # --- ADD THIS BLOCK ---
+        if self.config.market_type == 'future':
+            await self.exchange.set_leverage_and_margin_mode()
+        # --------------------
+
         self.exchange.balance = await self.exchange.fetch_balance()
-        print(f"Balance: {self.exchange.balance['USDT']} USDT")
+        # Note: Balance check might need to be more specific for futures (e.g., check USDT or BUSD)
+        print(f"Initial Balance Info: {self.exchange.balance['info']}")
 
         # Initialize WebSocket connection
         if self.config.frontend:
@@ -61,8 +84,8 @@ class GridBot:
 
     async def _handle_fee_coin(self):
         """Manage fee coin balance."""
-        if not self.config.fee_coin or not self.config.fee_coin.enabled:
-            return
+        # Fee coin management disabled for perpetual futures strategy
+        return
 
         while self.running:
             try:
@@ -107,7 +130,7 @@ class GridBot:
                             price=Decimal(str(order['price'])),
                             amount=Decimal(str(order['amount'])),
                             cost=Decimal(str(order['cost'])),
-                            timestamp=int(order['timestamp'])
+                            timestamp=int(order['timestamp']) if order['timestamp'] is not None else int(datetime.now().timestamp() * 1000)
                         )
                         await self.strategy.handle_filled_order(this_trade)
                         self._update_stats()
@@ -157,24 +180,13 @@ class GridBot:
             self.ws_manager.send_update('stats', {}, stats)
 
     def _calculate_total_profit(self) -> float:
-        """Calculate total profit from completed trades."""
-        total_profit = Decimal('0')
-        for trade in self.strategy.completed_trades:
-            profit = (trade.sell_price - trade.buy_price) * trade.amount
-            total_profit += profit
-        return float(total_profit)
+        """Calculate total profit from completed trades. NOT ACCURATE FOR NEW STRATEGY."""
+        print("Warning: Profit calculation is not implemented for the new perpetuals strategy.")
+        return 0.0 # Return 0 for now
 
     def _calculate_period_profit(self, hours: int) -> float:
-        """Calculate profit for a specific time period."""
-        period_start = datetime.now() - timedelta(hours=hours)
-        period_profit = Decimal('0')
-
-        for trade in self.strategy.completed_trades:
-            if trade.timestamp >= period_start.timestamp() * 1000:
-                profit = (trade.sell_price - trade.buy_price) * trade.amount
-                period_profit += profit
-
-        return float(period_profit)
+        """Calculate profit for a specific time period. NOT ACCURATE FOR NEW STRATEGY."""
+        return 0.0 # Return 0 for now
 
     async def run(self):
         """Main bot execution loop."""
@@ -187,8 +199,9 @@ class GridBot:
                 asyncio.create_task(self._monitor_health()),
             ]
 
-            if self.config.fee_coin and self.config.fee_coin.enabled:
-                self.tasks.append(asyncio.create_task(self._handle_fee_coin()))
+            # Fee coin management disabled for perpetual futures strategy
+            # if self.config.fee_coin and self.config.fee_coin.enabled:
+            #     self.tasks.append(asyncio.create_task(self._handle_fee_coin()))
 
             if self.config.frontend:
                 self.tasks.extend([

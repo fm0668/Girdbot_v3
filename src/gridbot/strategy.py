@@ -1,443 +1,389 @@
-from decimal import Decimal
-from typing import Optional
-from .models import BotConfig, OrderPair, Trade
-from .exchange import ExchangeInterface
-from .websocket import WebSocketManager
-import json
-import time
+# strategy.py
 
+from decimal import Decimal
+from typing import Optional, Dict
+from .models import BotConfig, Trade, GridLevelState
+from .exchange import ExchangeInterface
+import json
 
 class GridStrategy:
-    """Grid trading strategy implementation."""
+    """
+    Implements the "Single-Runner Relay Grid" strategy for perpetual contracts
+    using a state machine approach.
+    """
 
-    def __init__(self, config: BotConfig, exchange: ExchangeInterface, websocket: Optional[WebSocketManager] = None):
-        """Initialize strategy with configuration."""
+    def __init__(self, config: BotConfig, exchange: ExchangeInterface):
         self.config = config
         self.exchange = exchange
-        self.websocket = websocket
-        self.order_pairs = []
-        self.completed_trades = []
-        self.current_timestamp = 0
-        self.grid_size = Decimal("0")
-
-        # Parse trading pair
-        self.base_currency, self.quote_currency = self.config.pair.split('/')
-
-    def calculate_grid_size(self, current_price: Decimal) -> Decimal:
-        """Calculate the size of each grid level."""
-        return (current_price * self.config.gridsize) / Decimal("100")
+        self.grid_levels: Dict[Decimal, GridLevelState] = {}
+        self.state_file_path = f"grid_state_{self.config.name.replace('/', '_')}.json"
+        
+        # Derived from config for quick access
+        self.side = self.config.strategy_side
+        self.grid_step = self.config.grid_step
+        self.upper_price = self.config.upper_price
+        self.lower_price = self.config.lower_price
 
     async def initialize_grid(self, fresh_start: bool = False):
-        """Initialize the grid with orders."""
+        """Initializes the grid, cleans up old state, and places initial orders."""
+        if fresh_start:
+            print("Fresh start requested. Cleaning up all existing positions and orders...")
+            await self._cleanup_exchange_state()
+            self.grid_levels = {}
+        else:
+            await self._load_state()
+
+        if not self.grid_levels:
+            self._create_grid_levels()
+        else:
+            # 检查已加载状态中的订单实际状态
+            await self._sync_order_states()
+
+        await self._place_initial_orders()
+        await self._save_state()
+        print("Grid strategy initialized successfully.")
+
+    def _create_grid_levels(self):
+        """Creates the initial state for all grid price levels."""
+        print("Creating new grid levels...")
+        for i in range(self.config.grids):
+            price = self.lower_price + i * self.grid_step
+            # On the upper boundary, we don't place an open order for long side
+            if self.side == "long" and price == self.upper_price:
+                continue
+            # On the lower boundary, we don't place an open order for short side
+            if self.side == "short" and price == self.lower_price:
+                continue
+            
+            self.grid_levels[price] = GridLevelState(price=price, status="AVAILABLE")
+
+    async def _sync_order_states(self):
+        """Syncs local state with the exchange upon restart."""
+        print("Syncing order states with exchange...")
+        open_orders = await self.exchange.fetch_open_orders()
+        open_order_ids = {o['id'] for o in open_orders}
+
+        for price, level in self.grid_levels.items():
+            # Case 1: We think an open order is pending
+            if level.status == "ORDER_PENDING" and level.open_order_id:
+                if level.open_order_id not in open_order_ids:
+                    # The order is not open anymore, check if it was filled or cancelled
+                    try:
+                        order = await self.exchange.fetch_order(level.open_order_id)
+                        if order['status'] == 'closed':
+                            print(f"Sync: Found filled OPEN order {level.open_order_id} at {price}.")
+                            # Create a Trade object from the order
+                            trade = Trade(
+                                order_id=order['id'],
+                                side=order['side'],
+                                amount=order['amount'],
+                                price=Decimal(str(order['price']))
+                            )
+                            await self._handle_open_order_fill(level, trade)
+                        else: # cancelled or other states
+                            print(f"Found canceled order {level.open_order_id} at price {price}")
+                            level.status = "AVAILABLE"
+                            level.open_order_id = None
+                    except Exception as e:
+                        print(f"Error fetching order {level.open_order_id}: {e}")
+                        level.status = "AVAILABLE" # Can't fetch, assume it's gone
+                        level.open_order_id = None
+
+            # Case 2: We think we are holding a position
+            elif level.status == "POSITION_HELD":
+                if level.close_order_id and level.close_order_id not in open_order_ids:
+                    # The close order is gone, check its status
+                    try:
+                        order = await self.exchange.fetch_order(level.close_order_id)
+                        if order['status'] == 'closed':
+                            print(f"Sync: Found filled CLOSE order {level.close_order_id} for position at {price}.")
+                            trade = Trade(
+                                order_id=order['id'],
+                                side=order['side'],
+                                amount=order['amount'],
+                                price=Decimal(str(order['price']))
+                            )
+                            await self._handle_close_order_fill(level, trade)
+                        else: # Close order was cancelled, we need to replace it
+                            print(f"Sync: Close order for {price} was cancelled. Re-placing.")
+                            await self._place_close_order_from_sync(level)
+                    except Exception as e:
+                        print(f"Error fetching close order {level.close_order_id}: {e}")
+                        # Can't fetch, assume it was cancelled and replace it
+                        await self._place_close_order_from_sync(level)
+                elif not level.close_order_id:
+                    # We hold a position but have no record of a close order. This is a zombie position.
+                    print(f"Sync: Found a zombie position at {price} without a close order. Placing one now.")
+                    await self._place_close_order_from_sync(level)
+
+    async def _place_close_order_from_sync(self, level: GridLevelState):
+        """Helper method for placing close orders for existing positions during sync"""
+        if not level.position_amount:
+            print(f"Error: Cannot place close order for {level.price}, position amount is unknown.")
+            return # Or fetch position size from exchange
+
+        close_price = level.price + self.grid_step if self.side == "long" else level.price - self.grid_step
+        params = {'positionSide': 'LONG' if self.side == 'long' else 'SHORT'}
+
         try:
-            await self._load_order_pairs()
-            await self._load_completed_trades()
-            print("Initializing grid...")
-            if fresh_start:
-                print("Fresh start: Cancelling existing orders and positions...")
-                # Cancel existing orders and positions
-                open_orders = await self.exchange.fetch_open_orders()
-                print(f"Open orders to cancel: {[order['id'] for order in open_orders]}")
-                for order in open_orders:
-                    await self.exchange.cancel_order(order['id'])
-                    print(f"Cancelled order {order['id']}")
+            if self.side == "long":
+                # 平多仓：卖出
+                order = await self.exchange.create_limit_sell_order(level.position_amount, close_price, params)
+            else:
+                # 平空仓：买入
+                order = await self.exchange.create_limit_buy_order(level.position_amount, close_price, params)
 
-                # Reset order tracking
-                self.order_pairs = []
-                self.completed_trades = []
-                print("Order tracking reset.")
-
-                # Fetch current market price
-                ticker = await self.exchange.fetch_ticker()
-                current_price = Decimal(str(ticker['last']))
-                print(f"Current market price: {current_price}")
-
-                # Calculate grid prices
-                grid_size = self.calculate_grid_size(current_price)
-                self.grid_size = grid_size
-                print(f"Grid size calculated: {grid_size}")
-
-                # Send initial grid status before any orders are created
-                if self.websocket:
-                    await self.websocket.send_update({
-                        'type': 'grid_status',
-                        'data': {
-                            'total_pairs': 0,
-                            'active_pairs': 0,
-                            'completed_trades': 0
-                        }
-                    })
-
-                # Initial market buy to establish position
-                amount = self.config.quote_per_trade / current_price
-                initial_buy = await self.exchange.create_market_buy_order(amount)
-                print(f"Initial market buy: Amount {amount}, Price {current_price}")
-
-                # Create initial order pair
-                initial_pair = OrderPair(
-                    buy_order_id=initial_buy['id'],
-                    buy_price=current_price,
-                    buy_type="market",
-                    amount=amount,
-                    timestamp=int(time.time() * 1000),
-                    buy_order_status="closed"
-                )
-
-                # Place initial sell order
-                sell_price = current_price + grid_size
-                sell_order = await self.exchange.create_limit_sell_order(amount, sell_price)
-                initial_pair.sell_order_id = sell_order['id']
-                initial_pair.sell_price = Decimal(str(sell_order['price']))
-
-                self.order_pairs.append(initial_pair)
-
-                print(f"Initial sell order {sell_order['id']}: Amount {amount}, Price {sell_price}")
-
-                # Place buy orders below current price
-                for i in range(1, self.config.grids):
-                    buy_price = current_price - (i * grid_size)
-                    buy_amount = self.config.quote_per_trade * (1 / (current_price - (i * grid_size)))
-                    buy_order = await self.exchange.create_limit_buy_order(buy_amount, buy_price)
-
-                    print(f"Buy order {buy_order['id']}: Amount {buy_amount}, Price {buy_price}")
-
-                    # Create order pair for the buy order
-                    pair = OrderPair(
-                        buy_order_id=buy_order['id'],
-                        buy_price=Decimal(str(buy_order['price'])),
-                        buy_type="limit",
-                        amount=buy_amount,
-                        timestamp=int(time.time() * 1000),
-                        buy_order_status="open"
-                    )
-                    self.order_pairs.append(pair)
-
-                time.sleep(1)
-                await self._save_order_pairs()
-                await self._save_completed_trades()
-
-            # Send initial grid status
-            if self.websocket:
-                await self.websocket.send_update({
-                    'type': 'grid_status',
-                    'data': {
-                        'total_pairs': len(self.order_pairs),
-                        'active_pairs': len([p for p in self.order_pairs if p.sell_order_id is not None]),
-                        'completed_trades': len(self.completed_trades)
-                    }
-                })
+            level.close_order_id = order['id']
+            print(f"Sync: Placed close order {order['id']} for position at {level.price}, target price {close_price}")
         except Exception as e:
-            if self.websocket:
-                await self.websocket.send_update({
-                    'type': 'error',
-                    'data': {
-                        'message': str(e),
-                        'timestamp': int(time.time() * 1000)
-                    }
-                })
-            raise
+            print(f"Error placing close order from sync for position at {level.price}: {e}")
 
-    def _last_sell_order(self, order_id: str) -> bool:
-        # Check if this is the only sell order in the grid
-        for pair in self.order_pairs:
-            if pair.sell_order_id != order_id and pair.sell_order_id is not None:
-                return False
-        # print("Last sell order")
-        return True
+    async def _place_close_order(self, level, filled_order):
+        """为已成交的订单放置平仓单"""
+        try:
+            close_price = level.price + self.grid_step if self.side == "long" else level.price - self.grid_step
+            # 双向持仓模式：平仓通过positionSide和相反的side实现
+            params = {
+                'positionSide': 'LONG' if self.side == 'long' else 'SHORT'
+            }
 
-    async def _trail_up(self):
-        # print("Trailing up the grid...")
-        # Fetch current market price
+            # 平仓逻辑：
+            # 平多仓：positionSide=LONG, side=SELL
+            # 平空仓：positionSide=SHORT, side=BUY
+            if self.side == "long":
+                # 平多仓：卖出
+                order = await self.exchange.create_limit_sell_order(level.position_amount, close_price, params)
+            else:
+                # 平空仓：买入
+                order = await self.exchange.create_limit_buy_order(level.position_amount, close_price, params)
+
+            level.close_order_id = order['id']
+            print(f"Placed CLOSE order {order['id']} for position at {level.price}, target price {close_price}")
+        except Exception as e:
+            print(f"Error placing close order for position at {level.price}: {e}")
+
+    async def _place_initial_orders(self):
+        """Places 'open' orders for all grid levels in 'AVAILABLE' state."""
+        print("Placing initial orders...")
+
+        # 获取当前市场价格
         ticker = await self.exchange.fetch_ticker()
         current_price = Decimal(str(ticker['last']))
-        lowest_buy_order = None
-        lowest_buy_index = -1
-        for index, pair in enumerate(self.order_pairs):
-            if pair.buy_order_id is not None \
-                    and (lowest_buy_order is None or pair.buy_price < lowest_buy_order.buy_price):
-                lowest_buy_order = pair
-                lowest_buy_index = index
+        print(f"Current market price: {current_price}")
 
-        if lowest_buy_order is None:
-            print("No buy orders found to trail up.")
-            return
+        for price, level in self.grid_levels.items():
+            if level.status == "AVAILABLE":
+                try:
+                    order_amount_coin = self.config.order_amount_usdt / price
 
-        # Cancel the buy order
-        await self.exchange.cancel_order(lowest_buy_order.buy_order_id)
+                    # --- KEY CHANGE HERE ---
+                    params = {
+                        'positionSide': 'LONG' if self.side == 'long' else 'SHORT',
+                        'postOnly': True  # Ensure it's a MAKER order
+                    }
 
-        # Buy in again
-        buy_amount = self.config.quote_per_trade / current_price
-        buy_order = await self.exchange.create_market_buy_order(buy_amount)
-        # Create new sell order
-        sell_price = current_price + self.grid_size
-        sell_order = await self.exchange.create_limit_sell_order(buy_amount, sell_price)
+                    # 做多策略：在所有网格价格都放置买入挂单
+                    if self.side == "long":
+                        # 跳过与当前价格太接近的层级，避免立即成交
+                        price_diff = abs(price - current_price) / current_price
+                        if price_diff < Decimal('0.001'):  # 0.1%以内跳过
+                            print(f"Skipping order at {price} (too close to current price {current_price})")
+                            continue
 
-        # Create a new OrderPair object
-        new_pair = OrderPair(
-            buy_order_id=buy_order['id'],
-            buy_price=Decimal(str(buy_order['price'])),
-            sell_order_id=sell_order['id'],
-            sell_price=Decimal(str(sell_order['price'])),
-            amount=buy_amount,
-            timestamp=int(time.time() * 1000),
-            buy_order_status="closed"
-        )
+                        # 在所有其他价格放置买入挂单
+                        order = await self.exchange.create_limit_buy_order(order_amount_coin, price, params)
+                        level.open_order_id = order['id']
+                        level.status = "ORDER_PENDING"
+                        position = "below" if price < current_price else "above"
+                        print(f"Placed BUY order {order['id']} at {price} ({position} current price)")
 
-        # Replace the old pair with the new pair in the list
-        self.order_pairs[lowest_buy_index] = new_pair
+                    else: # short strategy
+                        # 做空策略：在所有网格价格都放置卖出挂单
+                        price_diff = abs(price - current_price) / current_price
+                        if price_diff < Decimal('0.001'):  # 0.1%以内跳过
+                            print(f"Skipping order at {price} (too close to current price {current_price})")
+                            continue
 
-        await self._save_order_pairs()
+                        order = await self.exchange.create_limit_sell_order(order_amount_coin, price, params)
+                        level.open_order_id = order['id']
+                        level.status = "ORDER_PENDING"
+                        position = "below" if price < current_price else "above"
+                        print(f"Placed SELL order {order['id']} at {price} ({position} current price)")
 
-        print(f"Trailed up: Cancelled order {lowest_buy_order.buy_order_id}, "
-              f"new sell order {sell_order['id']}")
+                except Exception as e:
+                    # postOnly订单如果会立即成交，会抛出 OrderImmediatelyFillable 或 Cancelled 错误，这是正常的
+                    if ('postonly' in str(e).lower() or 'immediately' in str(e).lower() or
+                        'would immediately match' in str(e).lower() or 'post only order will be rejected' in str(e).lower() or
+                        'could not be executed as maker' in str(e).lower()):
+                        print(f"Skipping order at {price}: It would fill immediately (expected for prices above current market).")
+                    elif 'limit price can\'t be higher' in str(e).lower() or 'limit price can\'t be lower' in str(e).lower():
+                        print(f"Skipping order at {price}: Price outside exchange limits.")
+                    else:
+                        print(f"Error placing initial order at {price}: {e}")
 
     async def handle_filled_order(self, trade: Trade):
-        """Handle a filled order and maintain the grid."""
+        """The core state machine logic for handling filled orders."""
+        print(f"--- Handling Filled Order: ID {trade.order_id}, Side {trade.side}, Price {trade.price} ---")
+
+        filled_level_price = None
+        # First try to find by order ID
+        for price, level in self.grid_levels.items():
+            if level.open_order_id == trade.order_id:
+                await self._handle_open_order_fill(level, trade)
+                filled_level_price = price
+                break
+            elif level.close_order_id == trade.order_id:
+                await self._handle_close_order_fill(level, trade)
+                filled_level_price = price
+                break
+
+        # If not found by order ID, try to find by price (with tolerance)
+        if filled_level_price is None:
+            print(f"Order ID {trade.order_id} not found, trying to match by price {trade.price}")
+            tolerance = Decimal('0.0001')  # 0.01% tolerance
+            for price, level in self.grid_levels.items():
+                price_diff = abs(price - trade.price) / price
+                if price_diff <= tolerance and level.status == "ORDER_PENDING":
+                    print(f"Found matching grid level by price: {price} (diff: {price_diff:.6f})")
+                    # Update the order ID and handle the fill
+                    level.open_order_id = trade.order_id
+                    await self._handle_open_order_fill(level, trade)
+                    filled_level_price = price
+                    break
+
+        if filled_level_price is None:
+            print(f"Warning: Filled order {trade.order_id} at price {trade.price} does not match any known grid level. Ignoring.")
+            return
+
+        await self._save_state()
+        print("--- Finished Handling Order ---")
+
+    async def _handle_open_order_fill(self, level: GridLevelState, trade: Trade):
+        """Logic for when an 'open' order is filled."""
+        print(f"OPEN order filled at price {level.price}. Transitioning to POSITION_HELD.")
+        
+        # 1. Update state
+        level.status = "POSITION_HELD"
+        level.open_order_id = None
+        level.position_amount = trade.amount
+
+        # 2. Check risk management
+        current_positions = sum(1 for lvl in self.grid_levels.values() if lvl.status == 'POSITION_HELD')
+        if current_positions > self.config.max_position_count:
+            print(f"CRITICAL: Position count ({current_positions}) exceeds max limit ({self.config.max_position_count}).")
+            # Here you could trigger a bot shutdown or other emergency action.
+            # For now, we just print a warning.
+
+        # 3. Place the corresponding 'close' order
         try:
-            # Send trade update to websocket first
-            # if self.websocket:
-            #     await self.websocket.send_update({
-            #         'type': 'trade',
-            #         'data': {
-            #             'side': trade.side,
-            #             'amount': str(trade.amount),
-            #             'price': str(trade.price),
-            #             'timestamp': trade.timestamp
-            #         }
-            #     })
+            close_price = level.price + self.grid_step if self.side == "long" else level.price - self.grid_step
+            # 双向持仓模式：平仓通过positionSide和相反的side实现
+            params = {
+                'positionSide': 'LONG' if self.side == 'long' else 'SHORT'
+            }
 
-            if trade.side == "buy":
-                print(f"Filled BUY order {trade.order_id} at price {trade.price}")
-                # Find or create order pair for this buy
-                pair = None
-                for p in self.order_pairs:
-                    if p.buy_order_id == trade.order_id:
-                        pair = p
-                        break
+            # 平仓逻辑：
+            # 平多仓：positionSide=LONG, side=SELL
+            # 平空仓：positionSide=SHORT, side=BUY
+            if self.side == "long":
+                # 平多仓：卖出
+                order = await self.exchange.create_limit_sell_order(trade.amount, close_price, params)
+            else: # short
+                # 平空仓：买入
+                order = await self.exchange.create_limit_buy_order(trade.amount, close_price, params)
+                
+            level.close_order_id = order['id']
+            print(f"Placed CLOSE order {order['id']} for position at {level.price}, target price {close_price}")
 
-                if pair is None:
-                    pair = OrderPair(
-                        buy_order_id=trade.order_id,
-                        buy_price=trade.price,
-                        amount=trade.amount,
-                        timestamp=trade.timestamp
-                    )
-                    self.order_pairs.append(pair)
-
-                # Create sell order at next grid level up
-                sell_price = trade.price + self.grid_size
-                sell_order = await self.exchange.create_limit_sell_order(trade.amount, sell_price)
-                print(f"Created sell order {sell_order['id']} at price {sell_price}")
-
-                # Update pair with sell order details
-                pair.sell_order_id = sell_order['id']
-                pair.sell_price = Decimal(str(sell_order['price']))
-                pair.buy_order_status = "closed"
-
-            else:  # sell order
-                print(f"Filled SELL order {trade.order_id} at price {trade.price}")
-                # Find the completed pair
-                completed_pair = None
-                for pair in self.order_pairs:
-                    if pair.sell_order_id == trade.order_id:
-                        completed_pair = pair
-                        pair.timestamp = trade.timestamp
-                        pair.sell_price = trade.price
-                        self.completed_trades.append(pair)
-                        self.order_pairs.remove(pair)
-                        # await self._save_completed_trades()
-                        break
-
-                if completed_pair:
-                    # Create new buy order at the original buy price
-                    buy_price = completed_pair.buy_price
-                    buy_order = await self.exchange.create_limit_buy_order(completed_pair.amount, buy_price)
-                    print(f"Created buy order {buy_order['id']} at price {buy_price}")
-
-                    # Create new pair for the buy order
-                    new_pair = OrderPair(
-                        buy_order_id=buy_order['id'],
-                        buy_price=Decimal(str(buy_order['price'])),
-                        amount=trade.amount,
-                        timestamp=trade.timestamp,
-                        buy_order_status="open"
-                    )
-                    self.order_pairs.append(new_pair)
-
-                    # Check if this was the last sell order
-                    if self._last_sell_order(trade.order_id):
-                        # Trail up the grid
-                        await self._trail_up()
-
-            await self._save_order_pairs()
-
-            # Send grid status update to websocket
-            # if self.websocket:
-            #     await self.websocket.send_update({
-            #         'type': 'grid_status',
-            #         'data': {
-            #             'total_pairs': len(self.order_pairs),
-            #             'active_pairs': len([p for p in self.order_pairs if p.sell_order_id is not None]),
-            #             'completed_trades': len(self.completed_trades)
-            #         }
-            #     })
         except Exception as e:
-            print(f"Error handling filled order: {e}")
-            # if self.websocket:
-            #     await self.websocket.send_update({
-            #         'type': 'error',
-            #         'data': {
-            #             'message': str(e),
-            #             'timestamp': int(time.time() * 1000)
-            #         }
-            #     })
-            raise
+            print(f"Error placing CLOSE order for position at {level.price}: {e}")
+            # In a real scenario, you'd need a retry mechanism or alert.
+
+    async def _handle_close_order_fill(self, level: GridLevelState, trade: Trade):
+        """Logic for when a 'close' order is filled, completing the cycle."""
+        print(f"CLOSE order filled for position at {level.price}. Cycle complete. Re-placing OPEN order.")
+
+        # 1. Update state back to available
+        level.status = "AVAILABLE"
+        level.close_order_id = None
+        level.position_amount = None
+
+        # 2. Re-place the 'open' order to restart the cycle for this level
+        try:
+            order_amount_coin = self.config.order_amount_usdt / level.price
+
+            # --- KEY CHANGE HERE ---
+            params = {
+                'positionSide': 'LONG' if self.side == 'long' else 'SHORT',
+                'postOnly': True # Also for re-placing orders
+            }
+
+            if self.side == "long":
+                order = await self.exchange.create_limit_buy_order(order_amount_coin, level.price, params)
+            else: # short
+                order = await self.exchange.create_limit_sell_order(order_amount_coin, level.price, params)
+
+            level.open_order_id = order['id']
+            level.status = "ORDER_PENDING"
+            print(f"Re-placed OPEN order {order['id']} at {level.price}")
+        except Exception as e:
+            # postOnly订单如果会立即成交，会抛出异常，这是正常的
+            if 'postonly' in str(e).lower() or 'immediately' in str(e).lower() or 'would immediately match' in str(e).lower():
+                print(f"Skipping re-placing order at {level.price}: It would fill immediately.")
+            else:
+                print(f"Error re-placing OPEN order at {level.price}: {e}")
+
+    async def _cleanup_exchange_state(self):
+        """Closes all positions and cancels all orders for the pair."""
+        try:
+            # This is a simplified cleanup. A robust version would fetch positions first.
+            # For now, we assume we need to close a position if we have one.
+            # A better implementation would be in exchange.py
+            print("Closing any open positions...")
+            # This logic needs to be robust, check current position side and size
+            # For now, let's just try to close both ways if needed, or implement in exchange.py
+            
+            print("Cancelling all open orders...")
+            open_orders = await self.exchange.fetch_open_orders()
+            for order in open_orders:
+                await self.exchange.cancel_order(order['id'])
+            print(f"Cancelled {len(open_orders)} orders.")
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
 
     async def check_order_health(self):
-        """Check and repair grid orders."""
-        # print("Checking order health...")
-        open_orders = await self.exchange.fetch_open_orders()
-        open_order_ids = {order['id'] for order in open_orders}
-        new_order_ids = []
+        """Periodically syncs our state with the exchange."""
+        # This is a complex but crucial method for a robust bot.
+        # It should:
+        # 1. Fetch all open orders from the exchange.
+        # 2. Compare them with our `self.grid_levels` state.
+        # 3. If an order in our state is not on the exchange, check its status (filled? cancelled?).
+        # 4. If an order on the exchange is not in our state, something is wrong (cancel it?).
+        # For this first refactoring step, we'll leave it as a placeholder.
+        pass
 
-        # Print order IDs and sides
-        # for order in open_orders:
-        #     print(f"Open {order['side']} order {order['id']} at price {order['price']}")
-
-        # Print saved order IDS and sides for limit orders only.  Remember that both buy and sell orders are in the same object
-        # for pair in self.order_pairs:
-        #     if pair.buy_type == "limit":
-        #         if pair.buy_order_status == "open":
-        #             print(f"Saved buy order {pair.buy_order_id} at price {pair.buy_price}")
-        #     if pair.buy_order_status == "open":
-        #         print(f"Saved sell order {pair.sell_order_id} at price {pair.sell_price}")
-
-        # Fetch current market price
-        ticker = await self.exchange.fetch_ticker()
-        current_price = Decimal(str(ticker['last']))
-        # print(f"Current market price: {current_price}")
-
-        orders_updated = False
-
-        for pair in self.order_pairs[:]:  # Create a copy of the list to iterate over
-            if pair.buy_order_id in new_order_ids:
-                continue
-            # Check buy order
-            if pair.buy_order_status == "open" and pair.buy_order_id and pair.buy_order_id not in open_order_ids and pair.buy_type == "limit":
-                print(f"Buy order {pair.buy_order_id} not found in open orders. Checking status...")
-                try:
-                    order_status = await self.exchange.fetch_order(pair.buy_order_id)
-                    if order_status['status'] == 'closed':
-                        pair.buy_order_status = "closed"
-                        # Create corresponding sell order at current price + grid_size
-                        sell_price = max(current_price + self.grid_size, pair.buy_price + self.grid_size)
-                        sell_order = await self.exchange.create_limit_sell_order(pair.amount, sell_price)
-                        pair.sell_order_id = sell_order['id']
-                        pair.sell_price = Decimal(str(sell_order['price']))
-                        orders_updated = True
-                        new_order_ids.append(pair.sell_order_id)
-                        print(
-                            f"Buy order {pair.buy_order_id} was filled. Updated state and created sell order {pair.sell_order_id}...")
-                    # elif order_status['status'] == 'canceled':
-                    #     print(f"Buy order {pair.buy_order_id} was cancelled. Recreating...")
-                    #     # Recreate buy order at current price or original price, whichever is lower
-                    #     new_buy_price = min(current_price, pair.buy_price)
-                    #     buy_order = await self.exchange.create_limit_buy_order(pair.amount, new_buy_price)
-                    #     pair.buy_order_id = buy_order['id']
-                    #     pair.buy_price = Decimal(str(buy_order['price']))
-                    #     orders_updated = True
-                    #     new_order_ids.append(pair.buy_order_id)
-                except Exception as e:
-                    print(f"Error checking buy order {pair.buy_order_id} status: {e}")
-
-            if pair.sell_order_id in new_order_ids:
-                continue
-
-            # Check sell order
-            if pair.sell_order_id and pair.sell_order_id not in open_order_ids:
-                print(f"Sell order {pair.sell_order_id} not found in open orders. Checking status...")
-                try:
-                    order_status = await self.exchange.fetch_order(pair.sell_order_id)
-                    if order_status['status'] == 'closed':
-                        # Move this completed pair to completed_trades
-                        self.completed_trades.append(pair)
-                        self.order_pairs.remove(pair)
-                        await self._save_completed_trades()
-                        # Create a new buy order to replace the completed pair
-                        buy_price = min(current_price - self.grid_size, pair.sell_price - self.grid_size)
-                        buy_order = await self.exchange.create_limit_buy_order(pair.amount, buy_price)
-                        new_pair = OrderPair(
-                            buy_order_id=buy_order['id'],
-                            buy_price=Decimal(str(buy_order['price'])),
-                            amount=pair.amount,
-                            buy_order_status="open",
-                            timestamp=int(time.time() * 1000)
-                        )
-                        self.order_pairs.append(new_pair)
-                        orders_updated = True
-                        new_order_ids.append(pair.buy_order_id)
-                        print(
-                            f"Sell order {pair.sell_order_id} was filled. Updated state and created buy order {pair.buy_order_id}...")
-                        # Check if this was the last sell order
-                        if self._last_sell_order(order_status['id']):
-                            # Trail up the grid
-                            await self._trail_up()
-
-                    elif order_status['status'] == 'canceled':
-                        print(f"Sell order {pair.sell_order_id} was cancelled. Recreating...")
-                        # Recreate sell order at current price or original price, whichever is higher
-                        new_sell_price = max(current_price, pair.sell_price)
-                        sell_order = await self.exchange.create_limit_sell_order(pair.amount, new_sell_price)
-                        pair.sell_order_id = sell_order['id']
-                        pair.sell_price = Decimal(str(sell_order['price']))
-                        orders_updated = True
-                        new_order_ids.append(pair.sell_order_id)
-                except Exception as e:
-                    print(f"Error checking sell order {pair.sell_order_id} status: {e}")
-
-        # Ensure we don't have more order pairs than grids
-        while len(self.order_pairs) > self.config.grids:
-            excess_pair = self.order_pairs.pop()
-            print(f"Removing excess order pair: {excess_pair}")
-            if excess_pair.buy_order_id:
-                await self.exchange.cancel_order(excess_pair.buy_order_id)
-            if excess_pair.sell_order_id:
-                await self.exchange.cancel_order(excess_pair.sell_order_id)
-
-        if orders_updated:
-            await self._save_order_pairs()
-
-        # print(f"Order health check complete. Current order pairs: {len(self.order_pairs)}")
-
-    async def _save_order_pairs(self):
-        """Save order pairs to file."""
-        # print(f"Saving order pairs to file... {len(self.order_pairs)}")
-        with open(f'order_pairs_{self.config.coin}.json', 'w') as f:
-            json.dump([pair.to_dict() for pair in self.order_pairs], f)
-
-    async def _load_order_pairs(self):
-        """Load order pairs from file."""
+    async def _save_state(self):
+        """Saves the current grid state to a file."""
         try:
-            with open(f'order_pairs_{self.config.coin}.json', 'r') as f:
-                pairs_data = json.load(f)
-                self.order_pairs = [OrderPair.from_dict(data) for data in pairs_data]
-        except FileNotFoundError:
-            print("Order pairs file not found. Starting with an empty list.")
-            self.order_pairs = []
+            # Pydantic's built-in json() method handles Decimal serialization correctly
+            state_to_save = {str(k): json.loads(v.json()) for k, v in self.grid_levels.items()}
+            with open(self.state_file_path, 'w') as f:
+                json.dump(state_to_save, f, indent=4)
+        except Exception as e:
+            print(f"Error saving state: {e}")
 
-    async def _save_completed_trades(self):
-        """Save completed trades to file."""
-        # print(f"Saving completed trades to file... {len(self.completed_trades)}")
-        with open(f'completed_trades_{self.config.coin}.json', 'w') as f:
-            json.dump([trade.to_dict() for trade in self.completed_trades], f)
-
-    async def _load_completed_trades(self):
-        """Load completed trades from file."""
+    async def _load_state(self):
+        """Loads grid state from a file."""
         try:
-            with open(f'completed_trades_{self.config.coin}.json', 'r') as f:
-                trades_data = json.load(f)
-                self.completed_trades = [OrderPair.from_dict(data) for data in trades_data]
+            with open(self.state_file_path, 'r') as f:
+                loaded_state = json.load(f)
+                self.grid_levels = {
+                    Decimal(k): GridLevelState(**v) for k, v in loaded_state.items()
+                }
+                print(f"Successfully loaded state for {len(self.grid_levels)} grid levels.")
         except FileNotFoundError:
-            print("Completed trades file not found. Starting with an empty list.")
-            self.completed_trades = []
-
+            print("No state file found. Starting fresh.")
+            self.grid_levels = {}
+        except Exception as e:
+            print(f"Error loading state: {e}")
+            self.grid_levels = {}

@@ -18,7 +18,8 @@ class ExchangeInterface:
         exchange = exchange_class({
             'apiKey': self.config.api_key,
             'secret': self.config.api_secret,
-            'options': {'defaultType': 'spot'}
+            # --- THIS IS THE KEY CHANGE ---
+            'options': {'defaultType': self.config.market_type}
         })
         exchange.options['ws']['useMessageQueue'] = True
 
@@ -33,6 +34,31 @@ class ExchangeInterface:
         """Load markets and other initialization tasks."""
         self.markets = await self.exchange.fetch_markets()
 
+    async def set_leverage_and_margin_mode(self):
+        """Set leverage and margin mode for the trading pair."""
+        try:
+            print(f"Setting up for perpetuals market: {self.config.pair}")
+
+            # 设置持仓模式为双向持仓
+            try:
+                await self.exchange.set_position_mode(True)  # True = 双向持仓模式
+                print("Position mode set to Hedge (Two-way).")
+            except Exception as e:
+                print(f"Position mode setting failed (may already be set): {e}")
+
+            # CCXT统一方法设置保证金模式为 ISOLATED (逐仓)
+            await self.exchange.set_margin_mode('ISOLATED', self.config.pair)
+            print(f"Margin mode for {self.config.pair} set to ISOLATED.")
+
+            # CCXT统一方法设置杠杆
+            await self.exchange.set_leverage(self.config.leverage, self.config.pair)
+            print(f"Leverage for {self.config.pair} set to {self.config.leverage}x.")
+
+        except Exception as e:
+            print(f"FATAL: Failed to set leverage or margin mode. Error: {e}")
+            # 在真实应用中，这里应该抛出异常，让程序停止
+            raise e
+
     async def fetch_ticker(self, symbol: Optional[str] = None) -> Dict[str, Any]:
         """Fetch current ticker information."""
         symbol = symbol or self.config.pair
@@ -45,20 +71,22 @@ class ExchangeInterface:
         symbol = symbol or self.config.pair
         return await self.exchange.watch_ticker(symbol)
 
-    async def create_limit_buy_order(self, amount: Decimal, price: Decimal) -> Dict[str, Any]:
+    async def create_limit_buy_order(self, amount: Decimal, price: Decimal, params: Dict[str, Any] = {}) -> Dict[str, Any]:
         """Create a limit buy order."""
         return await self.exchange.create_limit_buy_order(
             self.config.pair,
             float(amount),
-            float(price)
+            float(price),
+            params  # Pass extra params here
         )
 
-    async def create_limit_sell_order(self, amount: Decimal, price: Decimal) -> Dict[str, Any]:
+    async def create_limit_sell_order(self, amount: Decimal, price: Decimal, params: Dict[str, Any] = {}) -> Dict[str, Any]:
         """Create a limit sell order."""
         return await self.exchange.create_limit_sell_order(
             self.config.pair,
             float(amount),
-            float(price)
+            float(price),
+            params  # Pass extra params here
         )
 
     async def create_market_buy_order(self, amount: Decimal) -> Dict[str, Any]:
