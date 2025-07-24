@@ -154,9 +154,10 @@ class GridBot:
     async def _monitor_health(self):
         """定期检查订单健康状态"""
         while self.running:
-            await asyncio.sleep(60)
+            await asyncio.sleep(300)  # 每5分钟检查一次
             try:
-                await self.strategy.check_order_health()
+                if hasattr(self.strategy, 'health_check'):
+                    await self.strategy.health_check()
             except Exception as e:
                 print(f"健康检查错误：{e}")
 
@@ -182,13 +183,27 @@ class GridBot:
             self.ws_manager.send_update('stats', {}, stats)
 
     def _calculate_total_profit(self) -> float:
-        """计算已完成交易的总利润。新永续合约策略尚未实现准确计算。"""
-        # 静默返回，不打印警告
-        return 0.0 # Return 0 for now
+        """计算已完成交易的总利润"""
+        if hasattr(self, 'strategy') and self.strategy:
+            return float(self.strategy.total_realized_profit)
+        return 0.0
 
     def _calculate_period_profit(self, hours: int) -> float:
-        """计算特定时间段的利润。新永续合约策略尚未实现准确计算。"""
-        return 0.0 # Return 0 for now
+        """计算特定时间段的利润"""
+        if not hasattr(self, 'strategy') or not self.strategy:
+            return 0.0
+
+        # 计算时间范围
+        current_time = datetime.now().timestamp() * 1000
+        start_time = current_time - (hours * 60 * 60 * 1000)
+
+        # 统计时间段内的利润
+        period_profit = Decimal('0')
+        for record in self.strategy.profit_records:
+            if record.timestamp >= start_time:
+                period_profit += record.profit_usdt
+
+        return float(period_profit)
 
     def _print_strategy_status(self):
         """打印有意义的策略状态信息"""

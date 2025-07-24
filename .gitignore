@@ -41,6 +41,7 @@ order_pairs_*.json
 # Runtime files
 grid_state_*.json
 completed_trades_*.json
+profit_records_*.json
 session_context.json
 Session.vim
 

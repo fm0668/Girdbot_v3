@@ -102,6 +102,18 @@ class Trade(BaseModel):
     timestamp: int = Field(gt=0)
 
 
+class ProfitRecord(BaseModel):
+    """利润记录模型"""
+    grid_id: str
+    open_price: Decimal
+    close_price: Decimal
+    amount: Decimal
+    profit_usdt: Decimal
+    profit_percentage: Decimal
+    timestamp: int
+    side: Literal["long", "short"]
+
+
 # 建议新增一个状态模型，用于新的策略逻辑
 class GridLevelState(BaseModel):
     id: str  # 唯一标识符，格式如 "grid_001", "grid_002"
@@ -110,3 +122,7 @@ class GridLevelState(BaseModel):
     open_order_id: Optional[str] = None
     close_order_id: Optional[str] = None
     position_amount: Optional[Decimal] = None
+    # 新增利润追踪字段
+    open_timestamp: Optional[int] = None
+    total_profit: Decimal = Decimal('0')
+    trade_count: int = 0

@@ -2,10 +2,11 @@
 
 import asyncio
 import json
+import os
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional, Dict
-from .models import BotConfig, Trade, GridLevelState
+from typing import Optional, Dict, List, Any
+from .models import BotConfig, Trade, GridLevelState, ProfitRecord
 from .exchange import ExchangeInterface
 
 class GridStrategy:
@@ -27,14 +28,24 @@ class GridStrategy:
         self.upper_price = self.config.upper_price
         self.lower_price = self.config.lower_price
 
+        # 利润追踪相关
+        self.profit_records: List[ProfitRecord] = []
+        self.total_realized_profit = Decimal('0')
+        self.profit_file_path = f"profit_records_{self.config.name.replace('/', '_')}.json"
+
     async def initialize_grid(self, fresh_start: bool = False):
         """初始化网格，清理旧状态，并放置初始订单"""
         if fresh_start:
             print("请求全新开始。正在清理所有现有持仓和订单...")
             await self._cleanup_exchange_state()
             self.grid_levels = {}
+            # 清理利润记录
+            self.profit_records = []
+            self.total_realized_profit = Decimal('0')
         else:
             await self._load_state()
+            # 加载历史利润记录
+            await self._load_profit_records()
 
         if not self.grid_levels:
             self._create_grid_levels()
@@ -345,6 +356,7 @@ class GridStrategy:
         level.status = "POSITION_HELD"
         level.open_order_id = None
         level.position_amount = trade.amount
+        level.open_timestamp = trade.timestamp  # 记录开仓时间
 
         # 2. Check risk management
         current_positions = sum(1 for lvl in self.grid_levels.values() if lvl.status == 'POSITION_HELD')
@@ -379,13 +391,41 @@ class GridStrategy:
             # In a real scenario, you'd need a retry mechanism or alert.
 
     async def _handle_close_order_fill(self, level: GridLevelState, trade: Trade):
-        """处理平仓订单成交的逻辑，完成一个完整周期"""
-        print(f"价格 {level.price} 的平仓订单成交，周期完成，重新放置开仓订单")
+        """处理平仓订单成交的逻辑，完成一个完整周期并计算利润"""
+        print(f"价格 {level.price} 的平仓订单成交，周期完成，计算利润...")
+
+        # 计算本次交易利润
+        profit_usdt = self._calculate_grid_profit(level, trade)
+
+        # 记录利润
+        profit_record = ProfitRecord(
+            grid_id=level.id,
+            open_price=level.price,
+            close_price=trade.price,
+            amount=trade.amount,
+            profit_usdt=profit_usdt,
+            profit_percentage=(profit_usdt / (level.price * trade.amount)) * 100 if level.price * trade.amount > 0 else Decimal('0'),
+            timestamp=trade.timestamp,
+            side=self.side
+        )
+
+        self.profit_records.append(profit_record)
+        self.total_realized_profit += profit_usdt
+
+        # 更新网格层级统计
+        level.total_profit += profit_usdt
+        level.trade_count += 1
+
+        print(f"✅ 网格 {level.id} 完成交易，利润: {profit_usdt:.4f} USDT ({profit_record.profit_percentage:.2f}%)")
+
+        # 保存利润记录
+        await self._save_profit_records()
 
         # 1. Update state back to available
         level.status = "AVAILABLE"
         level.close_order_id = None
         level.position_amount = None
+        level.open_timestamp = None
 
         # 2. Re-place the 'open' order to restart the cycle for this level
         try:
@@ -547,3 +587,218 @@ class GridStrategy:
             print(f"加载状态时出错：{e}")
             self.grid_levels = {}
             self.price_to_id = {}
+
+    def _calculate_grid_profit(self, level: GridLevelState, close_trade: Trade) -> Decimal:
+        """计算单个网格的利润"""
+        if self.side == "long":
+            # 做多：买入价格低，卖出价格高，利润 = (卖出价 - 买入价) * 数量
+            profit = (close_trade.price - level.price) * close_trade.amount
+        else:
+            # 做空：卖出价格高，买入价格低，利润 = (卖出价 - 买入价) * 数量
+            profit = (level.price - close_trade.price) * close_trade.amount
+
+        # 扣除手续费（假设手续费率0.1%）
+        fee_rate = Decimal('0.001')
+        total_fee = (level.price * close_trade.amount + close_trade.price * close_trade.amount) * fee_rate
+
+        return profit - total_fee
+
+    async def _save_profit_records(self):
+        """保存利润记录到文件"""
+        try:
+            profit_data = {
+                'total_realized_profit': str(self.total_realized_profit),
+                'records': [
+                    {
+                        'grid_id': record.grid_id,
+                        'open_price': str(record.open_price),
+                        'close_price': str(record.close_price),
+                        'amount': str(record.amount),
+                        'profit_usdt': str(record.profit_usdt),
+                        'profit_percentage': str(record.profit_percentage),
+                        'timestamp': record.timestamp,
+                        'side': record.side
+                    }
+                    for record in self.profit_records
+                ]
+            }
+            with open(self.profit_file_path, 'w') as f:
+                json.dump(profit_data, f, indent=4)
+        except Exception as e:
+            print(f"保存利润记录时出错：{e}")
+
+    async def _load_profit_records(self):
+        """加载历史利润记录"""
+        try:
+            if os.path.exists(self.profit_file_path):
+                with open(self.profit_file_path, 'r') as f:
+                    data = json.load(f)
+                    self.total_realized_profit = Decimal(data.get('total_realized_profit', '0'))
+
+                    records_data = data.get('records', [])
+                    self.profit_records = []
+                    for record_data in records_data:
+                        record = ProfitRecord(
+                            grid_id=record_data['grid_id'],
+                            open_price=Decimal(record_data['open_price']),
+                            close_price=Decimal(record_data['close_price']),
+                            amount=Decimal(record_data['amount']),
+                            profit_usdt=Decimal(record_data['profit_usdt']),
+                            profit_percentage=Decimal(record_data['profit_percentage']),
+                            timestamp=record_data['timestamp'],
+                            side=record_data['side']
+                        )
+                        self.profit_records.append(record)
+
+                    print(f"加载了 {len(self.profit_records)} 条利润记录，总利润: {self.total_realized_profit} USDT")
+        except Exception as e:
+            print(f"加载利润记录时出错：{e}")
+
+    async def health_check(self):
+        """订单健康检查机制"""
+        print("🔍 开始订单健康检查...")
+
+        try:
+            # 1. 检查订单状态一致性
+            await self._check_order_consistency()
+
+            # 2. 检查持仓一致性
+            await self._check_position_consistency()
+
+            # 3. 检查孤儿订单
+            await self._check_orphan_orders()
+
+            print("✅ 订单健康检查完成")
+
+        except Exception as e:
+            print(f"❌ 健康检查时出错：{e}")
+
+    async def _check_order_consistency(self):
+        """检查订单状态一致性"""
+        print("检查订单状态一致性...")
+
+        inconsistent_count = 0
+
+        for grid_id, level in self.grid_levels.items():
+            try:
+                # 检查开仓订单
+                if level.open_order_id and level.status == "ORDER_PENDING":
+                    order = await self.exchange.fetch_order(level.open_order_id)
+                    if order['status'] == 'closed':
+                        print(f"⚠️ 发现未同步的开仓订单：{grid_id} - {level.open_order_id}")
+                        # 创建Trade对象并处理
+                        trade_data = {
+                            'order_id': order.get('id'),
+                            'side': order.get('side'),
+                            'symbol': order.get('symbol', self.config.pair),
+                            'price': Decimal(str(order.get('average', order.get('price')))),
+                            'amount': Decimal(str(order.get('filled', order.get('amount')))),
+                            'cost': Decimal(str(order.get('cost', '0'))),
+                            'timestamp': int(order.get('timestamp') or datetime.now().timestamp() * 1000)
+                        }
+                        trade = Trade(**trade_data)
+                        await self._handle_open_order_fill(level, trade)
+                        inconsistent_count += 1
+
+                # 检查平仓订单
+                if level.close_order_id and level.status == "POSITION_HELD":
+                    order = await self.exchange.fetch_order(level.close_order_id)
+                    if order['status'] == 'closed':
+                        print(f"⚠️ 发现未同步的平仓订单：{grid_id} - {level.close_order_id}")
+                        # 创建Trade对象并处理
+                        trade_data = {
+                            'order_id': order.get('id'),
+                            'side': order.get('side'),
+                            'symbol': order.get('symbol', self.config.pair),
+                            'price': Decimal(str(order.get('average', order.get('price')))),
+                            'amount': Decimal(str(order.get('filled', order.get('amount')))),
+                            'cost': Decimal(str(order.get('cost', '0'))),
+                            'timestamp': int(order.get('timestamp') or datetime.now().timestamp() * 1000)
+                        }
+                        trade = Trade(**trade_data)
+                        await self._handle_close_order_fill(level, trade)
+                        inconsistent_count += 1
+
+            except Exception as e:
+                print(f"检查网格 {grid_id} 时出错：{e}")
+
+        if inconsistent_count > 0:
+            print(f"🔧 修复了 {inconsistent_count} 个状态不一致的订单")
+            await self._save_state()
+        else:
+            print("✅ 所有订单状态一致")
+
+    async def _check_position_consistency(self):
+        """检查持仓一致性"""
+        print("检查持仓一致性...")
+
+        try:
+            # 获取交易所实际持仓
+            positions = await self.exchange.fetch_positions([self.config.pair])
+
+            # 计算本地记录的持仓
+            local_position = Decimal('0')
+            for level in self.grid_levels.values():
+                if level.status == "POSITION_HELD" and level.position_amount:
+                    if self.side == "long":
+                        local_position += level.position_amount
+                    else:
+                        local_position -= level.position_amount
+
+            # 获取交易所实际持仓
+            exchange_position = Decimal('0')
+            for position in positions:
+                symbol = position.get('symbol', '')
+                if symbol == self.config.pair or symbol.startswith(self.config.pair):
+                    contracts = Decimal(str(position.get('contracts', '0')))
+                    side = position.get('side')
+                    if side == 'long':
+                        exchange_position += contracts
+                    else:
+                        exchange_position -= contracts
+
+            # 比较持仓差异
+            position_diff = abs(local_position - exchange_position)
+            tolerance = Decimal('0.01')  # 允许0.01的误差
+
+            if position_diff > tolerance:
+                print(f"⚠️ 持仓不一致：本地记录 {local_position}，交易所实际 {exchange_position}")
+                print(f"差异：{position_diff}，建议手动检查")
+            else:
+                print(f"✅ 持仓一致：{local_position}")
+
+        except Exception as e:
+            print(f"检查持仓一致性时出错：{e}")
+
+    async def _check_orphan_orders(self):
+        """检查孤儿订单（交易所有但本地没有记录的订单）"""
+        print("检查孤儿订单...")
+
+        try:
+            # 获取交易所所有开放订单
+            exchange_orders = await self.exchange.fetch_open_orders()
+
+            # 收集本地记录的所有订单ID
+            local_order_ids = set()
+            for level in self.grid_levels.values():
+                if level.open_order_id:
+                    local_order_ids.add(level.open_order_id)
+                if level.close_order_id:
+                    local_order_ids.add(level.close_order_id)
+
+            # 查找孤儿订单
+            orphan_orders = []
+            for order in exchange_orders:
+                if order['id'] not in local_order_ids:
+                    orphan_orders.append(order)
+
+            if orphan_orders:
+                print(f"⚠️ 发现 {len(orphan_orders)} 个孤儿订单：")
+                for order in orphan_orders:
+                    print(f"  订单ID: {order['id']}, 价格: {order.get('price')}, 数量: {order.get('amount')}")
+                print("建议手动检查这些订单是否需要取消")
+            else:
+                print("✅ 未发现孤儿订单")
+
+        except Exception as e:
+            print(f"检查孤儿订单时出错：{e}")
