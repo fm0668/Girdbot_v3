@@ -8,6 +8,8 @@ from decimal import Decimal
 from typing import Optional, Dict, List, Any
 from .models import BotConfig, Trade, GridLevelState, ProfitRecord
 from .exchange import ExchangeInterface
+from .grid_manager import GridManager
+from .profit_tracker import ProfitTracker
 
 class GridStrategy:
     """
@@ -18,24 +20,22 @@ class GridStrategy:
     def __init__(self, config: BotConfig, exchange: ExchangeInterface):
         self.config = config
         self.exchange = exchange
-        self.grid_levels: Dict[str, GridLevelState] = {}  # 改为以ID为key
-        self.price_to_id: Dict[Decimal, str] = {}  # 价格到ID的映射
-        self.state_file_path = f"grid_state_{self.config.name.replace('/', '_')}.json"
-        
+
+        # 使用专门的管理器
+        self.grid_manager = GridManager(config)
+        self.profit_tracker = ProfitTracker(config)
+
+        # 保持向后兼容的属性访问
+        self.grid_levels = self.grid_manager.grid_levels
+        self.price_to_id = self.grid_manager.price_to_id
+        self.profit_records = self.profit_tracker.profit_records
+        self.total_realized_profit = self.profit_tracker.total_realized_profit
+
         # 从配置中获取常用参数，便于快速访问
         self.side = self.config.strategy_side
         self.grid_step = self.config.grid_step
         self.upper_price = self.config.upper_price
         self.lower_price = self.config.lower_price
-
-        # 利润追踪相关
-        self.profit_records: List[ProfitRecord] = []
-        self.total_realized_profit = Decimal('0')
-        self.profit_file_path = f"profit_records_{self.config.name.replace('/', '_')}.json"
-
-        # 手续费信息（将在初始化时获取实际费率）
-        self.maker_fee_rate = Decimal('0')  # USDC期货默认maker费率为0
-        self.taker_fee_rate = Decimal('0')  # USDC期货默认taker费率为0
 
     async def initialize_grid(self, fresh_start: bool = False):
         """初始化网格，清理旧状态，并放置初始订单"""
@@ -45,17 +45,15 @@ class GridStrategy:
         if fresh_start:
             print("请求全新开始。正在清理所有现有持仓和订单...")
             await self._cleanup_exchange_state()
-            self.grid_levels = {}
-            # 清理利润记录
-            self.profit_records = []
-            self.total_realized_profit = Decimal('0')
+            self.grid_manager.grid_levels = {}
+            self.profit_tracker.profit_records = []
+            self.profit_tracker.total_realized_profit = Decimal('0')
         else:
-            await self._load_state()
-            # 加载历史利润记录
-            await self._load_profit_records()
+            await self.grid_manager.load_state()
+            await self.profit_tracker.load_profit_records()
 
-        if not self.grid_levels:
-            self._create_grid_levels()
+        if not self.grid_manager.grid_levels:
+            self.grid_manager.create_grid_levels()
         else:
             # 检查已加载状态中的订单实际状态
             await self._sync_order_states()
@@ -71,7 +69,7 @@ class GridStrategy:
         await self._process_immediate_fills()
         # --------------------------
 
-        await self._save_state()
+        await self.grid_manager.save_state()
         print("网格策略初始化成功。")
 
     async def _fetch_trading_fees(self):
@@ -80,35 +78,18 @@ class GridStrategy:
             fees = await self.exchange.fetch_trading_fees()
 
             if fees:
-                self.maker_fee_rate = Decimal(str(fees.get('maker', 0)))
-                self.taker_fee_rate = Decimal(str(fees.get('taker', 0)))
+                maker_rate = Decimal(str(fees.get('maker', 0)))
+                taker_rate = Decimal(str(fees.get('taker', 0)))
 
-                print(f"📊 手续费信息：Maker {self.maker_fee_rate:.4f}%, Taker {self.taker_fee_rate:.4f}%")
+                self.profit_tracker.set_fee_rates(maker_rate, taker_rate)
+                print(f"📊 手续费信息：Maker {maker_rate:.4f}%, Taker {taker_rate:.4f}%")
             else:
                 print("📊 手续费信息：使用默认值 (USDC期货通常为0%)")
 
         except Exception as e:
             print(f"⚠️ 获取手续费信息失败，使用默认值0%：{e}")
-            # 保持默认值0%
 
-    def _create_grid_levels(self):
-        """创建所有网格价格层级的初始状态"""
-        print("正在创建新的网格层级...")
-        for i in range(self.config.grids):
-            price = self.lower_price + i * self.grid_step
-            # 在上边界，做多策略不放置开仓单
-            if self.side == "long" and price == self.upper_price:
-                continue
-            # 在下边界，做空策略不放置开仓单
-            if self.side == "short" and price == self.lower_price:
-                continue
 
-            # 创建唯一ID
-            grid_id = f"grid_{i:03d}"  # 格式：grid_000, grid_001, etc.
-            level = GridLevelState(id=grid_id, price=price, status="AVAILABLE")
-
-            self.grid_levels[grid_id] = level
-            self.price_to_id[price] = grid_id
 
     async def _process_immediate_fills(self):
         """
@@ -322,54 +303,29 @@ class GridStrategy:
         """处理已成交订单的核心状态机逻辑"""
         print(f"--- 处理已成交订单：ID {trade.order_id}，方向 {trade.side}，价格 {trade.price} ---")
 
-        found_level = None
-        found_grid_id = None
+        # 1. 通过订单ID查找网格
+        found_level = self.grid_manager.find_grid_by_order_id(trade.order_id)
+        found_grid_id = found_level.id if found_level else None
 
-        # 1. 首先通过订单ID查找
-        for grid_id, level in self.grid_levels.items():
-            if level.open_order_id == trade.order_id:
-                print(f"通过订单ID找到开仓订单：网格 {grid_id}")
-                await self._handle_open_order_fill(level, trade)
-                found_level = level
-                found_grid_id = grid_id
-                break
-            elif level.close_order_id == trade.order_id:
-                print(f"通过订单ID找到平仓订单：网格 {grid_id}")
-                await self._handle_close_order_fill(level, trade)
-                found_level = level
-                found_grid_id = grid_id
-                break
-
-        # 2. 如果订单ID不匹配，通过价格匹配（容错处理）
+        # 2. 如果订单ID不匹配，通过价格匹配
         if found_level is None:
             print(f"未找到订单ID {trade.order_id}，尝试通过价格 {trade.price} 匹配")
-            tolerance = Decimal('0.0001')  # 0.01% tolerance
-
-            for grid_id, level in self.grid_levels.items():
-                price_diff = abs(level.price - trade.price) / level.price
-                if price_diff <= tolerance:
-                    if level.status == "ORDER_PENDING":
-                        print(f"通过价格找到匹配的开仓网格：{grid_id}（价格差异：{price_diff:.6f}）")
-                        # 更新订单ID并处理成交
-                        level.open_order_id = trade.order_id
-                        await self._handle_open_order_fill(level, trade)
-                        found_level = level
-                        found_grid_id = grid_id
-                        break
-                    elif level.status == "POSITION_HELD" and level.close_order_id:
-                        print(f"通过价格找到匹配的平仓网格：{grid_id}（价格差异：{price_diff:.6f}）")
-                        # 更新订单ID并处理成交
-                        level.close_order_id = trade.order_id
-                        await self._handle_close_order_fill(level, trade)
-                        found_level = level
-                        found_grid_id = grid_id
-                        break
+            found_level = self.grid_manager.find_grid_by_price(trade.price)
+            found_grid_id = found_level.id if found_level else None
 
         if found_level is None:
             print(f"警告：已成交订单 {trade.order_id}（价格 {trade.price}）不匹配任何已知网格层级，忽略处理")
             return
 
-        await self._save_state()
+        # 3. 处理订单成交
+        if found_level.open_order_id == trade.order_id:
+            print(f"通过订单ID找到开仓订单：网格 {found_grid_id}")
+            await self._handle_open_order_fill(found_level, trade)
+        elif found_level.close_order_id == trade.order_id:
+            print(f"通过订单ID找到平仓订单：网格 {found_grid_id}")
+            await self._handle_close_order_fill(found_level, trade)
+
+        await self.grid_manager.save_state()
         print(f"--- 网格 {found_grid_id} 订单处理完成 ---")
 
     async def _handle_open_order_fill(self, level: GridLevelState, trade: Trade):
@@ -418,40 +374,21 @@ class GridStrategy:
         """处理平仓订单成交的逻辑，完成一个完整周期并计算利润"""
         print(f"价格 {level.price} 的平仓订单成交，周期完成，计算利润...")
 
-        # 计算本次交易利润
-        profit_usdt = self._calculate_grid_profit(level, trade)
+        # 使用利润追踪器记录利润
+        profit_record = self.profit_tracker.record_profit(level, trade)
 
-        # 记录利润
-        profit_record = ProfitRecord(
-            grid_id=level.id,
-            open_price=level.price,
-            close_price=trade.price,
-            amount=trade.amount,
-            profit_usdt=profit_usdt,
-            profit_percentage=(profit_usdt / (level.price * trade.amount)) * 100 if level.price * trade.amount > 0 else Decimal('0'),
-            timestamp=trade.timestamp,
-            side=self.side
-        )
-
-        self.profit_records.append(profit_record)
-        self.total_realized_profit += profit_usdt
-
-        # 更新网格层级统计
-        level.total_profit += profit_usdt
-        level.trade_count += 1
-
-        # 根据利润正负显示不同的图标和颜色提示
-        if profit_usdt >= 0:
+        # 显示利润信息
+        if profit_record.profit_usdt >= 0:
             status_icon = "✅"
             profit_desc = "盈利"
         else:
             status_icon = "📉"
             profit_desc = "亏损"
 
-        print(f"{status_icon} 网格 {level.id} 完成交易，{profit_desc}: {profit_usdt:.4f} USDT ({profit_record.profit_percentage:.2f}%)")
+        print(f"{status_icon} 网格 {level.id} 完成交易，{profit_desc}: {profit_record.profit_usdt:.4f} USDT ({profit_record.profit_percentage:.2f}%)")
 
         # 保存利润记录
-        await self._save_profit_records()
+        await self.profit_tracker.save_profit_records()
 
         # 1. Update state back to available
         level.status = "AVAILABLE"
@@ -578,9 +515,7 @@ class GridStrategy:
             import os
 
             # 删除状态文件
-            if os.path.exists(self.state_file_path):
-                os.remove(self.state_file_path)
-                print(f"✅ 已删除状态文件：{self.state_file_path}")
+            await self.grid_manager.cleanup_local_state_files()
 
             # 保留利润记录文件，因为它记录的是历史数据
             print("💰 保留利润记录文件，维持交易历史连续性")
@@ -599,127 +534,11 @@ class GridStrategy:
         # For this first refactoring step, we'll leave it as a placeholder.
         pass
 
-    async def _save_state(self):
-        """将当前网格状态保存到文件"""
-        try:
-            # 保存网格状态和价格映射
-            state_to_save = {
-                'grid_levels': {grid_id: json.loads(level.json()) for grid_id, level in self.grid_levels.items()},
-                'price_to_id': {str(price): grid_id for price, grid_id in self.price_to_id.items()}
-            }
-            with open(self.state_file_path, 'w') as f:
-                json.dump(state_to_save, f, indent=4)
-        except Exception as e:
-            print(f"保存状态时出错：{e}")
 
-    async def _load_state(self):
-        """从文件加载网格状态"""
-        try:
-            with open(self.state_file_path, 'r') as f:
-                loaded_state = json.load(f)
 
-                # 加载网格层级
-                self.grid_levels = {
-                    grid_id: GridLevelState(**level_data)
-                    for grid_id, level_data in loaded_state.get('grid_levels', {}).items()
-                }
 
-                # 加载价格映射
-                self.price_to_id = {
-                    Decimal(price_str): grid_id
-                    for price_str, grid_id in loaded_state.get('price_to_id', {}).items()
-                }
 
-                print(f"成功加载 {len(self.grid_levels)} 个网格层级的状态")
-        except FileNotFoundError:
-            print("未找到状态文件，全新开始")
-            self.grid_levels = {}
-            self.price_to_id = {}
-        except Exception as e:
-            print(f"加载状态时出错：{e}")
-            self.grid_levels = {}
-            self.price_to_id = {}
 
-    def _calculate_grid_profit(self, level: GridLevelState, close_trade: Trade) -> Decimal:
-        """
-        计算单个网格的利润
-
-        做空策略说明：
-        - 开仓：在高价卖出（level.price）
-        - 平仓：在低价买入（close_trade.price）
-        - 盈利条件：平仓价格 < 开仓价格（价格下跌）
-        - 亏损条件：平仓价格 > 开仓价格（价格上涨）
-
-        这是正确的做空逻辑，负利润表示价格上涨导致的亏损
-        """
-        if self.side == "long":
-            # 做多：买入价格低，卖出价格高，利润 = (卖出价 - 买入价) * 数量
-            profit = (close_trade.price - level.price) * close_trade.amount
-        else:
-            # 做空：卖出价格高，买入价格低，利润 = (卖出价 - 买入价) * 数量
-            # 当 level.price > close_trade.price 时盈利（价格下跌）
-            # 当 level.price < close_trade.price 时亏损（价格上涨）
-            profit = (level.price - close_trade.price) * close_trade.amount
-
-        # 扣除手续费（使用实际交易所费率）
-        # 开仓和平仓都可能产生手续费，这里使用taker费率（因为我们使用限价单但可能立即成交）
-        # 对于USDC期货，通常maker和taker费率都是0%
-        open_fee = level.price * close_trade.amount * self.taker_fee_rate
-        close_fee = close_trade.price * close_trade.amount * self.taker_fee_rate
-        total_fee = open_fee + close_fee
-
-        return profit - total_fee
-
-    async def _save_profit_records(self):
-        """保存利润记录到文件"""
-        try:
-            profit_data = {
-                'total_realized_profit': str(self.total_realized_profit),
-                'records': [
-                    {
-                        'grid_id': record.grid_id,
-                        'open_price': str(record.open_price),
-                        'close_price': str(record.close_price),
-                        'amount': str(record.amount),
-                        'profit_usdt': str(record.profit_usdt),
-                        'profit_percentage': str(record.profit_percentage),
-                        'timestamp': record.timestamp,
-                        'side': record.side
-                    }
-                    for record in self.profit_records
-                ]
-            }
-            with open(self.profit_file_path, 'w') as f:
-                json.dump(profit_data, f, indent=4)
-        except Exception as e:
-            print(f"保存利润记录时出错：{e}")
-
-    async def _load_profit_records(self):
-        """加载历史利润记录"""
-        try:
-            if os.path.exists(self.profit_file_path):
-                with open(self.profit_file_path, 'r') as f:
-                    data = json.load(f)
-                    self.total_realized_profit = Decimal(data.get('total_realized_profit', '0'))
-
-                    records_data = data.get('records', [])
-                    self.profit_records = []
-                    for record_data in records_data:
-                        record = ProfitRecord(
-                            grid_id=record_data['grid_id'],
-                            open_price=Decimal(record_data['open_price']),
-                            close_price=Decimal(record_data['close_price']),
-                            amount=Decimal(record_data['amount']),
-                            profit_usdt=Decimal(record_data['profit_usdt']),
-                            profit_percentage=Decimal(record_data['profit_percentage']),
-                            timestamp=record_data['timestamp'],
-                            side=record_data['side']
-                        )
-                        self.profit_records.append(record)
-
-                    print(f"加载了 {len(self.profit_records)} 条利润记录，总利润: {self.total_realized_profit} USDT")
-        except Exception as e:
-            print(f"加载利润记录时出错：{e}")
 
     async def health_check(self):
         """订单健康检查机制"""
@@ -791,7 +610,7 @@ class GridStrategy:
 
         if inconsistent_count > 0:
             print(f"🔧 修复了 {inconsistent_count} 个状态不一致的订单")
-            await self._save_state()
+            await self.grid_manager.save_state()
         else:
             print("✅ 所有订单状态一致")
 
