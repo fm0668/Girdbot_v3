@@ -8,6 +8,7 @@ from decimal import Decimal
 from .models import DualAccountConfig, BotConfig
 from .exchange import ExchangeInterface
 from .strategy import GridStrategy
+from .dual_utils import DualAccountUtils
 
 class DualAccountManager:
     """双账户管理器"""
@@ -15,19 +16,25 @@ class DualAccountManager:
     def __init__(self, config: DualAccountConfig):
         self.config = config
         self.running = False
-        
+        self.utils = DualAccountUtils()
+
+        # 验证配置
+        config_errors = self.utils.validate_dual_config(config)
+        if config_errors:
+            raise ValueError(f"配置错误: {'; '.join(config_errors)}")
+
         # 创建双账户配置
         self.long_config = config.to_single_config("long")
         self.short_config = config.to_single_config("short")
-        
+
         # 创建交易所接口
         self.long_exchange: Optional[ExchangeInterface] = None
         self.short_exchange: Optional[ExchangeInterface] = None
-        
+
         # 创建策略实例
         self.long_strategy: Optional[GridStrategy] = None
         self.short_strategy: Optional[GridStrategy] = None
-        
+
         # 状态跟踪
         self.long_running = False
         self.short_running = False
@@ -41,36 +48,32 @@ class DualAccountManager:
             # 1. 创建交易所接口
             self.long_exchange = ExchangeInterface(self.long_config)
             self.short_exchange = ExchangeInterface(self.short_config)
-            
-            # 2. 初始化交易所连接
-            await self.long_exchange.initialize()
-            await self.short_exchange.initialize()
-            print("✅ 双账户交易所连接初始化完成")
-            
-            # 3. 设置杠杆和保证金模式
-            if self.config.market_type == 'future':
-                await self.long_exchange.set_leverage_and_margin_mode()
-                await self.short_exchange.set_leverage_and_margin_mode()
-                print("✅ 双账户杠杆和保证金模式设置完成")
-            
-            # 4. 检查余额
-            await self._check_balances()
-            
-            # 5. 创建策略实例
+
+            # 2. 初始化交易所连接（使用工具类）
+            await self.utils.initialize_exchange_pair(
+                self.long_exchange, self.short_exchange, self.config.market_type
+            )
+
+            # 3. 检查余额（使用工具类）
+            await self.utils.check_balances_pair(
+                self.long_exchange, self.short_exchange, self.config
+            )
+
+            # 4. 创建策略实例
             self.long_strategy = GridStrategy(self.long_config, self.long_exchange)
             self.short_strategy = GridStrategy(self.short_config, self.short_exchange)
             print("✅ 双账户策略实例创建完成")
-            
-            # 6. 如果是全新开始，清理双账户状态
+
+            # 5. 如果是全新开始，清理双账户状态
             if fresh_start:
                 print("🧹 执行双账户清理...")
                 await self._cleanup_both_accounts()
-            
-            # 7. 初始化双账户网格
+
+            # 6. 初始化双账户网格（使用工具类）
             print("🚀 开始初始化双账户网格...")
-            await asyncio.gather(
-                self.long_strategy.initialize_grid(fresh_start),
-                self.short_strategy.initialize_grid(fresh_start)
+            await self.utils.execute_on_both(
+                self.long_strategy, self.short_strategy,
+                'initialize_grid', fresh_start
             )
             print("✅ 双账户网格初始化完成")
             
@@ -82,44 +85,21 @@ class DualAccountManager:
             await self._cleanup_on_error()
             raise
     
-    async def _check_balances(self):
-        """检查双账户余额"""
-        try:
-            long_balance = await self.long_exchange.fetch_balance()
-            short_balance = await self.short_exchange.fetch_balance()
-            
-            quote_coin = self.config.quote_coin
-            long_free = Decimal(str(long_balance['free'].get(quote_coin, 0)))
-            short_free = Decimal(str(short_balance['free'].get(quote_coin, 0)))
-            
-            print(f"💰 账户余额检查:")
-            print(f"   多头账户 {quote_coin}: {long_free}")
-            print(f"   空头账户 {quote_coin}: {short_free}")
-            
-            # 计算所需资金
-            required_per_account = self.config.order_amount_usdt * self.config.grids
-            
-            if long_free < required_per_account:
-                print(f"⚠️ 多头账户余额不足，需要至少 {required_per_account} {quote_coin}")
-            
-            if short_free < required_per_account:
-                print(f"⚠️ 空头账户余额不足，需要至少 {required_per_account} {quote_coin}")
-            
-        except Exception as e:
-            print(f"❌ 检查余额时出错: {e}")
+
     
     async def _cleanup_both_accounts(self):
-        """清理双账户状态"""
+        """清理双账户状态（使用工具类）"""
         print("🧹 开始清理双账户状态...")
-        
+
         try:
-            # 并行清理两个账户
-            await asyncio.gather(
-                self.long_strategy._cleanup_exchange_state(),
-                self.short_strategy._cleanup_exchange_state()
-            )
-            print("✅ 双账户状态清理完成")
-            
+            success = await self.utils.parallel_cleanup([
+                self.long_strategy, self.short_strategy
+            ])
+            if success:
+                print("✅ 双账户状态清理完成")
+            else:
+                print("⚠️ 双账户状态清理部分失败")
+
         except Exception as e:
             print(f"❌ 清理双账户状态时出错: {e}")
             raise

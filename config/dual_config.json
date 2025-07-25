@@ -11,11 +11,11 @@
     "market_type": "future",
     "pair": "DOGE/USDC",
 
-    "leverage": 10,
-    "lower_price": "0.23050",
-    "upper_price": "0.23130",
-    "grids": 10,
-    "order_amount_usdt": 6,
+    "leverage": 20,
+    "lower_price": "0.22135",
+    "upper_price": "0.24379",
+    "grids": 50,
+    "order_amount_usdt": 20,
 
     "frontend": true,
     "frontend_host": "localhost:8080"

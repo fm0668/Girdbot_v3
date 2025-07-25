@@ -150,7 +150,7 @@ class BoundaryMonitor:
             print("🚨 建议立即手动检查账户状态")
     
     async def _cleanup_dual_accounts(self) -> bool:
-        """清理双账户，返回是否成功"""
+        """清理双账户，使用已验证的策略清理方法"""
         try:
             # 创建双账户配置
             long_config = self.config.to_single_config("long")
@@ -169,14 +169,22 @@ class BoundaryMonitor:
                 await long_exchange.set_leverage_and_margin_mode()
                 await short_exchange.set_leverage_and_margin_mode()
 
+            # 创建策略实例以使用已验证的清理方法
+            from src.gridbot.strategy import GridStrategy
+
+            long_strategy = GridStrategy(long_config, long_exchange)
+            short_strategy = GridStrategy(short_config, short_exchange)
+
+            print("🧹 使用已验证的策略清理方法...")
+
             # 并行清理两个账户（最多重试3次）
             success = False
             for attempt in range(3):
                 print(f"🧹 第{attempt + 1}次尝试清理双账户...")
 
                 cleanup_tasks = [
-                    self._cleanup_single_account(long_exchange, "多头"),
-                    self._cleanup_single_account(short_exchange, "空头")
+                    long_strategy._cleanup_exchange_state(),
+                    short_strategy._cleanup_exchange_state()
                 ]
 
                 results = await asyncio.gather(*cleanup_tasks, return_exceptions=True)
@@ -209,65 +217,7 @@ class BoundaryMonitor:
             print(f"❌ 双账户清理失败: {e}")
             return False
     
-    async def _cleanup_single_account(self, exchange, account_name) -> bool:
-        """清理单个账户，返回是否成功"""
-        try:
-            print(f"🧹 开始清理{account_name}账户...")
 
-            # 1. 取消所有挂单
-            orders = await exchange.fetch_open_orders()
-            cancel_failed = 0
-            if orders:
-                print(f"📋 {account_name}账户发现 {len(orders)} 个挂单，开始取消...")
-                for order in orders:
-                    try:
-                        await exchange.cancel_order(order['id'])
-                        print(f"✅ 已取消{account_name}订单 {order['id']}")
-                    except Exception as e:
-                        print(f"⚠️ 取消{account_name}订单 {order['id']} 失败: {e}")
-                        cancel_failed += 1
-            else:
-                print(f"✅ {account_name}账户无挂单")
-
-            # 2. 平掉所有持仓
-            positions = await exchange.fetch_positions()
-            close_failed = 0
-            position_count = 0
-
-            for position in positions:
-                contracts = float(position.get('contracts', 0))
-                if abs(contracts) > 0:
-                    position_count += 1
-                    symbol = position.get('symbol', '')
-                    print(f"📋 {account_name}账户发现持仓: {contracts} {symbol}")
-
-                    try:
-                        # 使用市价单平仓
-                        if contracts > 0:  # 多头持仓
-                            await exchange.create_market_sell_order(abs(contracts))
-                            print(f"✅ {account_name}账户已平掉多头持仓 {abs(contracts)}")
-                        else:  # 空头持仓
-                            await exchange.create_market_buy_order(abs(contracts))
-                            print(f"✅ {account_name}账户已平掉空头持仓 {abs(contracts)}")
-                    except Exception as e:
-                        print(f"⚠️ {account_name}账户平仓失败: {e}")
-                        close_failed += 1
-
-            if position_count == 0:
-                print(f"✅ {account_name}账户无持仓")
-
-            # 判断清理是否成功
-            success = (cancel_failed == 0 and close_failed == 0)
-            if success:
-                print(f"✅ {account_name}账户清理完成")
-            else:
-                print(f"⚠️ {account_name}账户清理有问题：{cancel_failed}个挂单取消失败，{close_failed}个持仓平仓失败")
-
-            return success
-
-        except Exception as e:
-            print(f"❌ 清理{account_name}账户失败: {e}")
-            return False
 
     async def _verify_cleanup_results(self) -> bool:
         """验证清理结果，确保所有挂单和持仓都已清理"""

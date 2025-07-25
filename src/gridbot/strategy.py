@@ -514,9 +514,22 @@ class GridStrategy:
                 price = order.get('price', 0)
                 print(f"挂单详情：{symbol} | ID={order_id} | {side} | 数量={amount} | 价格={price}")
 
+            # 取消订单时增加错误容忍
+            cancelled_count = 0
+            failed_count = 0
             for order in open_orders:
-                await self.exchange.cancel_order(order['id'])
-            print(f"已取消 {len(open_orders)} 个订单")
+                try:
+                    await self.exchange.cancel_order(order['id'])
+                    cancelled_count += 1
+                except Exception as e:
+                    failed_count += 1
+                    error_msg = str(e)
+                    if "Unknown order" in error_msg or "-2011" in error_msg:
+                        print(f"订单 {order['id']} 可能已成交或已取消，跳过")
+                    else:
+                        print(f"取消订单 {order['id']} 失败: {e}")
+
+            print(f"已取消 {cancelled_count} 个订单，{failed_count} 个订单取消失败")
 
             # 2. 获取并平掉所有该交易对的持仓
             print("正在获取开放持仓...")
@@ -539,20 +552,32 @@ class GridStrategy:
 
             print(f"找到 {len(target_positions)} 个需要平仓的 {pair} 持仓")
 
+            # 平仓时增加错误容忍和重试机制
+            closed_count = 0
+            failed_count = 0
             for position in target_positions:
                 contracts = Decimal(str(position.get('contracts', '0')))
                 side = position.get('side')  # 'long' or 'short'
                 print(f"发现开放的{side}持仓：{contracts} {self.config.coin}，正在平仓...")
 
-                # 对冲模式下，必须指定要平掉哪一边的持仓
-                params = {'positionSide': side.upper()}  # 'LONG' or 'SHORT'
+                try:
+                    # 对冲模式下，必须指定要平掉哪一边的持仓
+                    params = {'positionSide': side.upper()}  # 'LONG' or 'SHORT'
 
-                # 使用修复后的平仓方法
-                await self.exchange.create_market_close_order(pair, side, contracts, params)
-                print(f"已提交市价单平掉{side}持仓")
+                    # 使用修复后的平仓方法
+                    await self.exchange.create_market_close_order(pair, side, contracts, params)
+                    print(f"已提交市价单平掉{side}持仓")
+                    closed_count += 1
 
-                # 等待平仓完成
-                await asyncio.sleep(1)  # 给交易所时间处理平仓
+                    # 等待平仓完成
+                    await asyncio.sleep(1)  # 给交易所时间处理平仓
+
+                except Exception as e:
+                    failed_count += 1
+                    print(f"平掉{side}持仓失败: {e}")
+                    # 继续尝试其他持仓
+
+            print(f"已平掉 {closed_count} 个持仓，{failed_count} 个持仓平仓失败")
 
             # 验证清理结果
             print("正在验证清理结果...")
@@ -583,6 +608,13 @@ class GridStrategy:
             print(f"--- {pair} 状态清理完成 ---")
         except Exception as e:
             print(f"清理交易所状态时出错：{e}")
+            # 即使出错也要尝试清理本地状态文件
+            try:
+                print("🧹 尝试清理本地状态文件...")
+                await self._cleanup_local_state_files()
+            except Exception as cleanup_error:
+                print(f"清理本地状态文件失败: {cleanup_error}")
+            # 不再抛出异常，让程序能够继续
 
     async def _cleanup_local_state_files(self):
         """清理交易所状态后，删除本地状态文件"""

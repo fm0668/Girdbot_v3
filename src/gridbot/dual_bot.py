@@ -4,6 +4,8 @@
 
 import asyncio
 import signal
+import subprocess
+import os
 from typing import Optional
 from .models import DualAccountConfig
 from .dual_account_manager import DualAccountManager
@@ -12,13 +14,15 @@ from .dual_config import load_dual_config
 class DualGridBot:
     """双账户网格机器人"""
     
-    def __init__(self, config_path: str, fresh_start: bool = False):
+    def __init__(self, config_path: str, fresh_start: bool = False, enable_boundary_monitor: bool = True):
         self.config_path = config_path
         self.fresh_start = fresh_start
+        self.enable_boundary_monitor = enable_boundary_monitor
         self.config: Optional[DualAccountConfig] = None
         self.manager: Optional[DualAccountManager] = None
         self.running = False
-        
+        self.boundary_monitor_process = None
+
         # 设置信号处理
         self._setup_signal_handlers()
     
@@ -32,6 +36,8 @@ class DualGridBot:
                 self.manager.running = False
                 self.manager.long_running = False
                 self.manager.short_running = False
+            # 停止边界监控进程
+            self._stop_boundary_monitor()
 
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
@@ -51,12 +57,16 @@ class DualGridBot:
             # 3. 初始化双账户
             await self.manager.initialize(self.fresh_start)
 
-            # 4. 开始运行
+            # 4. 启动边界监控（如果启用）
+            if self.enable_boundary_monitor:
+                self._start_boundary_monitor()
+
+            # 5. 开始运行
             self.running = True
             print("🚀 双账户网格机器人启动成功")
             print("按 Ctrl+C 优雅退出")
 
-            # 5. 开始监控（使用新的监控方式）
+            # 6. 开始监控（使用新的监控方式）
             await self._run_with_signal_handling()
 
         except KeyboardInterrupt:
@@ -65,6 +75,44 @@ class DualGridBot:
             print(f"❌ 机器人运行异常: {e}")
         finally:
             await self._cleanup()
+
+    def _start_boundary_monitor(self):
+        """启动边界监控进程"""
+        try:
+            print("🛡️ 启动边界监控程序...")
+
+            # 获取当前脚本的目录
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(os.path.dirname(current_dir))
+            boundary_script = os.path.join(project_root, "scripts", "boundary_monitor.py")
+
+            # 启动边界监控进程
+            self.boundary_monitor_process = subprocess.Popen([
+                "python3", boundary_script, self.config_path
+            ], cwd=project_root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            print(f"✅ 边界监控程序已启动 (PID: {self.boundary_monitor_process.pid})")
+
+        except Exception as e:
+            print(f"⚠️ 启动边界监控程序失败: {e}")
+            print("💡 您可以手动启动: python3 scripts/boundary_monitor.py config/dual_config.json")
+
+    def _stop_boundary_monitor(self):
+        """停止边界监控进程"""
+        if self.boundary_monitor_process:
+            try:
+                print("🛑 停止边界监控程序...")
+                self.boundary_monitor_process.terminate()
+                self.boundary_monitor_process.wait(timeout=5)
+                print("✅ 边界监控程序已停止")
+            except subprocess.TimeoutExpired:
+                print("⚠️ 边界监控程序未响应，强制终止...")
+                self.boundary_monitor_process.kill()
+                self.boundary_monitor_process.wait()
+            except Exception as e:
+                print(f"⚠️ 停止边界监控程序时出错: {e}")
+            finally:
+                self.boundary_monitor_process = None
 
     async def _run_with_signal_handling(self):
         """带信号处理的运行方法"""
@@ -97,6 +145,10 @@ class DualGridBot:
         print("🧹 开始清理资源...")
 
         try:
+            # 1. 停止边界监控程序
+            self._stop_boundary_monitor()
+
+            # 2. 清理双账户
             if self.manager:
                 # 使用成功验证的清理方法
                 await self.manager._execute_successful_cleanup()
