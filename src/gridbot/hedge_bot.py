@@ -9,6 +9,7 @@ from typing import Optional
 from .models import DualAccountConfig, Trade
 from .dual_account_manager import DualAccountManager
 from .hedge_pair_manager import HedgePairManager
+from .performance_monitor import PerformanceMonitor
 
 class HedgeGridBot:
     """对冲网格机器人"""
@@ -24,7 +25,10 @@ class HedgeGridBot:
         
         # 创建对冲配对管理器
         self.hedge_manager = HedgePairManager(self.dual_manager, config)
-        
+
+        # 添加性能监控器
+        self.performance_monitor = PerformanceMonitor()
+
         # 运行状态
         self.running = True
         self.tasks = []
@@ -69,10 +73,15 @@ class HedgeGridBot:
                 asyncio.create_task(self._watch_short_orders()),
                 asyncio.create_task(self._periodic_status_report())
             ])
+
+            # 6. 添加性能监控任务
+            self.tasks.append(
+                asyncio.create_task(self._performance_monitoring())
+            )
             
             print("✅ 对冲网格机器人启动完成")
             
-            # 6. 等待任务完成或中断
+            # 7. 等待任务完成或中断
             await asyncio.gather(*self.tasks, return_exceptions=True)
             
         except Exception as e:
@@ -86,6 +95,26 @@ class HedgeGridBot:
             asyncio.create_task(self._monitor_hedge_effectiveness()),
             asyncio.create_task(self._monitor_sync_delays())
         ]
+
+    async def _performance_monitoring(self):
+        """性能监控任务"""
+        while self.running:
+            try:
+                # 收集性能指标
+                metrics = await self.performance_monitor.collect_system_metrics()
+
+                # 检查性能告警
+                alerts = self.performance_monitor.check_performance_alerts()
+                if alerts:
+                    print(f"🚨 性能告警:")
+                    for alert in alerts:
+                        print(f"   {alert}")
+
+                await asyncio.sleep(30)  # 每30秒监控一次
+
+            except Exception as e:
+                print(f"❌ 性能监控异常: {e}")
+                await asyncio.sleep(30)
     
     async def _watch_long_orders(self):
         """监控多头账户订单"""
@@ -172,7 +201,7 @@ class HedgeGridBot:
                 await asyncio.sleep(60)
 
     async def _periodic_status_report(self):
-        """定期状态报告"""
+        """定期状态报告（增强版）"""
         while self.running:
             try:
                 # 获取双边统计
@@ -180,11 +209,24 @@ class HedgeGridBot:
                 short_stats = self.dual_manager.short_strategy.grid_manager.get_grid_statistics()
                 hedge_stats = self.hedge_manager.get_hedge_statistics()
 
+                # 添加性能统计
+                perf_summary = self.performance_monitor.get_performance_summary()
+
                 print(f"\n📊 === 对冲网格状态报告 ===")
                 print(f"多头账户: {long_stats['position_count']} 持仓, {long_stats['pending_count']} 挂单")
                 print(f"空头账户: {short_stats['position_count']} 持仓, {short_stats['pending_count']} 挂单")
                 print(f"对冲状态: {hedge_stats['balanced_pairs']}/{hedge_stats['total_pairs']} 平衡")
                 print(f"总利润: 多头 {long_stats['total_profit']:.2f} + 空头 {short_stats['total_profit']:.2f} USDT")
+
+                # 添加性能信息
+                if perf_summary:
+                    print(f"性能指标:")
+                    print(f"  订单成功率: {perf_summary['order_success_rate']:.2%}")
+                    print(f"  同步成功率: {perf_summary['sync_success_rate']:.2%}")
+                    print(f"  平均延迟: {perf_summary['avg_order_latency']:.1f}ms")
+                    print(f"  内存使用: {perf_summary['avg_memory_usage']:.1f}MB")
+                    print(f"  CPU使用: {perf_summary['avg_cpu_usage']:.1f}%")
+
                 print(f"=========================\n")
 
                 await asyncio.sleep(600)  # 每10分钟报告一次

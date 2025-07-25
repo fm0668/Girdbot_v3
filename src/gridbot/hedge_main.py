@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from .models import DualAccountConfig
 from .hedge_bot import HedgeGridBot
+from .config_validator import ConfigValidator
 
 def load_env_variables():
     """加载环境变量"""
@@ -60,23 +61,45 @@ def main():
     parser = argparse.ArgumentParser(description='对冲网格交易机器人')
     parser.add_argument('--config', type=str, required=True, help='双账户配置文件路径')
     parser.add_argument('--fresh', action='store_true', help='全新开始，清理所有现有持仓和订单')
-    
+    parser.add_argument('--validate-only', action='store_true', help='仅验证配置，不启动机器人')
+
     args = parser.parse_args()
-    
+
     # 检查配置文件是否存在
     if not Path(args.config).exists():
         print(f"❌ 配置文件不存在: {args.config}")
         sys.exit(1)
-    
+
     try:
         # 加载配置
         config = load_dual_config(args.config)
         print(f"✅ 成功加载配置: {config.name}")
-        
+
+        # 验证配置
+        validator = ConfigValidator(config)
+        is_valid, results = validator.validate_all()
+        validator.print_validation_results()
+
+        if not is_valid:
+            print("❌ 配置验证失败，请修复错误后重试")
+            sys.exit(1)
+
+        # 如果只是验证配置，则退出
+        if args.validate_only:
+            print("✅ 配置验证完成")
+            return
+
+        # 如果有警告，询问是否继续
+        if results['warnings']:
+            response = input("发现配置警告，是否继续启动？(y/N): ")
+            if response.lower() != 'y':
+                print("用户取消启动")
+                return
+
         # 创建并运行机器人
         bot = HedgeGridBot(config, fresh_start=args.fresh)
         asyncio.run(bot.run())
-        
+
     except KeyboardInterrupt:
         print("\n用户中断，正在退出...")
         sys.exit(0)

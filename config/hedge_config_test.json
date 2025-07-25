@@ -1,7 +1,7 @@
 {
     "name": "HedgeGridBot-Test",
     "exchange": "binance",
-    "sandbox_mode": true,
+    "sandbox_mode": false,
 
     "long_api_key": "${LONG_API_KEY}",
     "long_api_secret": "${LONG_API_SECRET}",
