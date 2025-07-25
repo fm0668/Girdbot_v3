@@ -126,3 +126,90 @@ class GridLevelState(BaseModel):
     open_timestamp: Optional[int] = None
     total_profit: Decimal = Decimal('0')
     trade_count: int = 0
+
+
+class DualAccountConfig(BaseModel):
+    """双账户配置模型"""
+
+    # 基础配置
+    name: str
+    exchange: str
+    sandbox_mode: bool
+
+    # 多头账户配置
+    long_api_key: str
+    long_api_secret: str
+
+    # 空头账户配置
+    short_api_key: str
+    short_api_secret: str
+
+    # 交易配置（两个账户共享）
+    market_type: Literal["future"] = "future"
+    pair: str
+    leverage: int = Field(gt=0)
+    lower_price: Decimal = Field(gt=0)
+    upper_price: Decimal = Field(gt=0)
+    grids: int = Field(gt=0)
+    order_amount_usdt: Decimal = Field(gt=0)
+    max_position_count: int = Field(gt=0)
+
+    # 对冲特定配置
+    hedge_mode: bool = True
+    max_imbalance_ratio: Decimal = Field(default=Decimal('0.1'), gt=0, lt=1)
+    sync_tolerance_seconds: int = Field(default=30, gt=0)
+
+    # 前端配置
+    frontend: bool = False
+    frontend_host: str = "localhost:8080"
+
+    @property
+    def coin(self) -> str:
+        return self.pair.split('/')[0]
+
+    @property
+    def grid_step(self) -> Decimal:
+        """Calculate the price difference between each grid level."""
+        return (self.upper_price - self.lower_price) / (self.grids - 1)
+
+    def create_long_config(self) -> BotConfig:
+        """创建多头账户配置"""
+        return BotConfig(
+            name=f"{self.name}_LONG",
+            exchange=self.exchange,
+            api_key=self.long_api_key,
+            api_secret=self.long_api_secret,
+            sandbox_mode=self.sandbox_mode,
+            market_type=self.market_type,
+            pair=self.pair,
+            strategy_side="long",
+            leverage=self.leverage,
+            lower_price=self.lower_price,
+            upper_price=self.upper_price,
+            grids=self.grids,
+            order_amount_usdt=self.order_amount_usdt,
+            max_position_count=self.max_position_count,
+            frontend=self.frontend,
+            frontend_host=self.frontend_host
+        )
+
+    def create_short_config(self) -> BotConfig:
+        """创建空头账户配置"""
+        return BotConfig(
+            name=f"{self.name}_SHORT",
+            exchange=self.exchange,
+            api_key=self.short_api_key,
+            api_secret=self.short_api_secret,
+            sandbox_mode=self.sandbox_mode,
+            market_type=self.market_type,
+            pair=self.pair,
+            strategy_side="short",
+            leverage=self.leverage,
+            lower_price=self.lower_price,
+            upper_price=self.upper_price,
+            grids=self.grids,
+            order_amount_usdt=self.order_amount_usdt,
+            max_position_count=self.max_position_count,
+            frontend=self.frontend,
+            frontend_host=self.frontend_host
+        )

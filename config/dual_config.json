@@ -1,0 +1,16 @@
+{
+    "name": "HedgeGridBot",
+    "exchange": "bybit",
+    "sandbox_mode": true,
+    "long_api_key": "long-account-key",
+    "long_api_secret": "long-account-secret",
+    "short_api_key": "short-account-key", 
+    "short_api_secret": "short-account-secret",
+    "pair": "BTC/USDT",
+    "leverage": 10,
+    "lower_price": "60000",
+    "upper_price": "70000",
+    "grids": 10,
+    "order_amount_usdt": 100,
+    "max_position_count": 5
+}
