@@ -126,3 +126,67 @@ class GridLevelState(BaseModel):
     open_timestamp: Optional[int] = None
     total_profit: Decimal = Decimal('0')
     trade_count: int = 0
+
+
+class DualAccountConfig(BaseModel):
+    """双账户配置模型"""
+    name: str
+    exchange: str
+    sandbox_mode: bool
+
+    # 双账户API配置
+    long_api_key: str
+    long_api_secret: str
+    short_api_key: str
+    short_api_secret: str
+
+    # 共享交易配置
+    market_type: Literal["spot", "future"] = "future"
+    pair: str
+    leverage: int = Field(gt=0)
+    lower_price: Decimal = Field(gt=0)
+    upper_price: Decimal = Field(gt=0)
+    grids: int = Field(gt=0)
+    order_amount_usdt: Decimal = Field(gt=0)
+
+    # 前端配置
+    frontend: bool = False
+    frontend_host: str = "localhost:8080"
+
+    # 派生属性
+    @property
+    def coin(self) -> str:
+        return self.pair.split('/')[0]
+
+    @property
+    def quote_coin(self) -> str:
+        return self.pair.split('/')[1]
+
+    @property
+    def grid_step(self) -> Decimal:
+        """计算网格步长"""
+        return (self.upper_price - self.lower_price) / (self.grids - 1)
+
+    def to_single_config(self, side: Literal["long", "short"]) -> BotConfig:
+        """转换为单账号配置"""
+        api_key = self.long_api_key if side == "long" else self.short_api_key
+        api_secret = self.long_api_secret if side == "long" else self.short_api_secret
+
+        return BotConfig(
+            name=f"{self.name}-{side}",
+            exchange=self.exchange,
+            api_key=api_key,
+            api_secret=api_secret,
+            sandbox_mode=self.sandbox_mode,
+            market_type=self.market_type,
+            pair=self.pair,
+            strategy_side=side,
+            leverage=self.leverage,
+            lower_price=self.lower_price,
+            upper_price=self.upper_price,
+            grids=self.grids,
+            order_amount_usdt=self.order_amount_usdt,
+            max_position_count=self.grids,  # 使用网格数作为最大持仓
+            frontend=self.frontend,
+            frontend_host=self.frontend_host
+        )

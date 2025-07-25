@@ -1,0 +1,22 @@
+{
+    "name": "DualGridBot-DOGE-Hedge",
+    "exchange": "binance",
+    "sandbox_mode": true,
+
+    "long_api_key": "${BINANCE_LONG_API_KEY}",
+    "long_api_secret": "${BINANCE_LONG_API_SECRET}",
+    "short_api_key": "${BINANCE_SHORT_API_KEY}",
+    "short_api_secret": "${BINANCE_SHORT_API_SECRET}",
+
+    "market_type": "future",
+    "pair": "DOGE/USDC",
+
+    "leverage": 10,
+    "lower_price": "0.22500",
+    "upper_price": "0.23500",
+    "grids": 20,
+    "order_amount_usdt": 10,
+
+    "frontend": true,
+    "frontend_host": "localhost:8080"
+}

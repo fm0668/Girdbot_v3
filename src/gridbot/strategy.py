@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import time
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional, Dict, List, Any
@@ -28,10 +29,21 @@ class GridStrategy:
         self.upper_price = self.config.upper_price
         self.lower_price = self.config.lower_price
 
+        # 验证边界设置的合理性
+        if self.lower_price >= self.upper_price:
+            raise ValueError(f"❌ 边界设置错误：下边界 {self.lower_price} 必须小于上边界 {self.upper_price}")
+
+        print(f"📊 网格边界设置：{self.lower_price} - {self.upper_price}")
+        print(f"🔍 边界突破检测已启用")
+
         # 利润追踪相关
         self.profit_records: List[ProfitRecord] = []
         self.total_realized_profit = Decimal('0')
         self.profit_file_path = f"profit_records_{self.config.name.replace('/', '_')}.json"
+
+        # 边界突破控制
+        self.boundary_breached = False
+        self.emergency_stop_triggered = False
 
         # 手续费信息（将在初始化时获取实际费率）
         self.maker_fee_rate = Decimal('0')  # USDC期货默认maker费率为0
@@ -721,6 +733,111 @@ class GridStrategy:
         except Exception as e:
             print(f"加载利润记录时出错：{e}")
 
+    async def watch_orders(self):
+        """监控和处理已完成的订单"""
+        # 添加运行状态标志
+        self.running = True
+
+        while self.running and not self.emergency_stop_triggered:
+            try:
+                # 定期检查边界突破（每10次循环检查一次，避免过于频繁）
+                if hasattr(self, '_boundary_check_counter'):
+                    self._boundary_check_counter += 1
+                else:
+                    self._boundary_check_counter = 0
+
+                if self._boundary_check_counter % 10 == 0:
+                    current_price = await self.get_current_market_price()
+                    if current_price > 0:
+                        boundary_breached = await self.check_boundary_breach(current_price)
+                        if boundary_breached:
+                            print(f"🚨 {self.side}账户因边界突破停止监控")
+                            break
+
+                orders = await self.exchange.watch_orders()
+                if orders is None or len(orders) == 0:
+                    await asyncio.sleep(0.01)
+                    continue
+
+                for order in orders:
+                    # 只处理已成交的订单
+                    if order.get('status') == 'closed' and order.get('filled', 0) > 0:
+                        # 转换为Trade对象
+                        timestamp = int(order['timestamp'] or 0)
+                        if timestamp <= 0:
+                            timestamp = int(time.time() * 1000)  # 使用当前时间戳
+
+                        trade = Trade(
+                            order_id=order['id'],
+                            side=order['side'],
+                            symbol=order['symbol'],
+                            amount=Decimal(str(order['filled'])),
+                            price=Decimal(str(order['average'] or order['price'])),
+                            cost=Decimal(str(order['cost'] or 0)),
+                            timestamp=timestamp
+                        )
+
+                        # 处理成交
+                        await self.handle_filled_order(trade)
+
+                await asyncio.sleep(0.1)
+
+            except Exception as e:
+                print(f"监控订单时出错：{e}")
+                await asyncio.sleep(1)
+
+                # 如果连续出错，可能需要停止
+                if not self.running:
+                    break
+
+    def stop_watching(self):
+        """停止监控订单"""
+        self.running = False
+
+    async def check_boundary_breach(self, current_price: Decimal) -> bool:
+        """检查是否突破边界价格"""
+        if self.boundary_breached or self.emergency_stop_triggered:
+            return True
+
+        # 检查是否突破上边界
+        if current_price > self.upper_price:
+            print(f"🚨 价格突破上边界！当前价格: {current_price}, 上边界: {self.upper_price}")
+            self.boundary_breached = True
+            await self._trigger_boundary_emergency_stop("价格突破上边界")
+            return True
+
+        # 检查是否突破下边界
+        if current_price < self.lower_price:
+            print(f"🚨 价格突破下边界！当前价格: {current_price}, 下边界: {self.lower_price}")
+            self.boundary_breached = True
+            await self._trigger_boundary_emergency_stop("价格突破下边界")
+            return True
+
+        return False
+
+    async def _trigger_boundary_emergency_stop(self, reason: str):
+        """触发边界突破紧急停止"""
+        print(f"🚨 触发边界突破紧急停止: {reason}")
+        self.emergency_stop_triggered = True
+        self.running = False
+
+        try:
+            # 执行清理
+            await self._cleanup_exchange_state()
+            print(f"✅ {self.side}账户边界突破清理完成")
+
+        except Exception as e:
+            print(f"❌ 边界突破清理失败: {e}")
+
+    async def get_current_market_price(self) -> Decimal:
+        """获取当前市场价格"""
+        try:
+            ticker = await self.exchange.fetch_ticker(self.config.pair)
+            return Decimal(str(ticker['last']))
+        except Exception as e:
+            print(f"获取市场价格失败: {e}")
+            return Decimal('0')
+
     async def health_check(self):
         """订单健康检查机制"""
         print("🔍 开始订单健康检查...")
@@ -729,10 +846,7 @@ class GridStrategy:
             # 1. 检查订单状态一致性
             await self._check_order_consistency()
 
-            # 2. 检查持仓一致性
-            await self._check_position_consistency()
-
-            # 3. 检查孤儿订单
+            # 2. 检查孤儿订单
             await self._check_orphan_orders()
 
             print("✅ 订单健康检查完成")
@@ -795,47 +909,7 @@ class GridStrategy:
         else:
             print("✅ 所有订单状态一致")
 
-    async def _check_position_consistency(self):
-        """检查持仓一致性"""
-        print("检查持仓一致性...")
 
-        try:
-            # 获取交易所实际持仓
-            positions = await self.exchange.fetch_positions([self.config.pair])
-
-            # 计算本地记录的持仓
-            local_position = Decimal('0')
-            for level in self.grid_levels.values():
-                if level.status == "POSITION_HELD" and level.position_amount:
-                    if self.side == "long":
-                        local_position += level.position_amount
-                    else:
-                        local_position -= level.position_amount
-
-            # 获取交易所实际持仓
-            exchange_position = Decimal('0')
-            for position in positions:
-                symbol = position.get('symbol', '')
-                if symbol == self.config.pair or symbol.startswith(self.config.pair):
-                    contracts = Decimal(str(position.get('contracts', '0')))
-                    side = position.get('side')
-                    if side == 'long':
-                        exchange_position += contracts
-                    else:
-                        exchange_position -= contracts
-
-            # 比较持仓差异
-            position_diff = abs(local_position - exchange_position)
-            tolerance = Decimal('0.01')  # 允许0.01的误差
-
-            if position_diff > tolerance:
-                print(f"⚠️ 持仓不一致：本地记录 {local_position}，交易所实际 {exchange_position}")
-                print(f"差异：{position_diff}，建议手动检查")
-            else:
-                print(f"✅ 持仓一致：{local_position}")
-
-        except Exception as e:
-            print(f"检查持仓一致性时出错：{e}")
 
     async def _check_orphan_orders(self):
         """检查孤儿订单（交易所有但本地没有记录的订单）"""
