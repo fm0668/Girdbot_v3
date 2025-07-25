@@ -12,8 +12,8 @@
     "pair": "DOGE/USDC",
 
     "leverage": 20,
-    "lower_price": "0.22135",
-    "upper_price": "0.24379",
+    "lower_price": "0.21000",
+    "upper_price": "0.23600",
     "grids": 50,
     "order_amount_usdt": 20,
 
