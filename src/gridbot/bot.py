@@ -73,7 +73,7 @@ class GridBot:
 
         self.exchange.balance = await self.exchange.fetch_balance()
         # Note: Balance check might need to be more specific for futures (e.g., check USDT or BUSD)
-        print(f"初始余额信息：{self.exchange.balance['info']}")
+        self._print_balance_info()
 
         # Initialize WebSocket connection
         if self.config.frontend:
@@ -81,6 +81,53 @@ class GridBot:
 
         # Initialize grid strategy
         await self.strategy.initialize_grid(self.fresh_start)
+
+    def _print_balance_info(self):
+        """格式化显示余额信息"""
+        try:
+            balance_info = self.exchange.balance['info']
+
+            # 提取关键信息
+            available_balance = "0.00"
+            wallet_balance = "0.00"
+            margin_balance = "0.00"
+            unrealized_pnl = "0.00"
+
+            # 查找USDC资产信息
+            assets = balance_info.get('assets', [])
+            for asset in assets:
+                if asset.get('asset') == 'USDC':
+                    available_balance = asset.get('availableBalance', '0.00')
+                    wallet_balance = asset.get('walletBalance', '0.00')
+                    margin_balance = asset.get('marginBalance', '0.00')
+                    unrealized_pnl = asset.get('unrealizedProfit', '0.00')
+                    break
+
+            # 格式化显示
+            print("💰 账户余额信息：")
+            print(f"   可用余额: {available_balance} USDC")
+            print(f"   钱包余额: {wallet_balance} USDC")
+            print(f"   保证金余额: {margin_balance} USDC")
+            print(f"   未实现盈亏: {unrealized_pnl} USDC")
+
+            # 显示持仓信息
+            positions = balance_info.get('positions', [])
+            active_positions = [pos for pos in positions if float(pos.get('positionAmt', '0')) != 0]
+
+            if active_positions:
+                print("📊 当前持仓：")
+                for pos in active_positions:
+                    symbol = pos.get('symbol', '')
+                    amount = pos.get('positionAmt', '0')
+                    side = pos.get('positionSide', '')
+                    unrealized = pos.get('unrealizedProfit', '0')
+                    print(f"   {symbol}: {amount} ({side}) | 未实现盈亏: {unrealized} USDC")
+            else:
+                print("📊 当前持仓: 无")
+
+        except Exception as e:
+            # 如果格式化失败，显示原始信息（但更简洁）
+            print(f"💰 余额信息: {self.exchange.balance.get('USDC', {}).get('free', '0')} USDC 可用")
 
     async def _handle_fee_coin(self):
         """Manage fee coin balance."""

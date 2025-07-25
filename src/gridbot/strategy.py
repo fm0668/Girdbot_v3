@@ -33,8 +33,15 @@ class GridStrategy:
         self.total_realized_profit = Decimal('0')
         self.profit_file_path = f"profit_records_{self.config.name.replace('/', '_')}.json"
 
+        # 手续费信息（将在初始化时获取实际费率）
+        self.maker_fee_rate = Decimal('0')  # USDC期货默认maker费率为0
+        self.taker_fee_rate = Decimal('0')  # USDC期货默认taker费率为0
+
     async def initialize_grid(self, fresh_start: bool = False):
         """初始化网格，清理旧状态，并放置初始订单"""
+        # 首先获取交易所手续费信息
+        await self._fetch_trading_fees()
+
         if fresh_start:
             print("请求全新开始。正在清理所有现有持仓和订单...")
             await self._cleanup_exchange_state()
@@ -56,7 +63,7 @@ class GridStrategy:
         await self._place_initial_orders()
 
         # --- 添加延时并主动检查立即成交的订单 ---
-        delay_seconds = 5  # 增加到5秒
+        delay_seconds = 3  # 优化为3秒，提高启动速度
         print(f"初始订单已提交。等待 {delay_seconds} 秒以处理立即成交的交易...")
         await asyncio.sleep(delay_seconds)
 
@@ -66,6 +73,23 @@ class GridStrategy:
 
         await self._save_state()
         print("网格策略初始化成功。")
+
+    async def _fetch_trading_fees(self):
+        """获取交易所手续费信息"""
+        try:
+            fees = await self.exchange.fetch_trading_fees()
+
+            if fees:
+                self.maker_fee_rate = Decimal(str(fees.get('maker', 0)))
+                self.taker_fee_rate = Decimal(str(fees.get('taker', 0)))
+
+                print(f"📊 手续费信息：Maker {self.maker_fee_rate:.4f}%, Taker {self.taker_fee_rate:.4f}%")
+            else:
+                print("📊 手续费信息：使用默认值 (USDC期货通常为0%)")
+
+        except Exception as e:
+            print(f"⚠️ 获取手续费信息失败，使用默认值0%：{e}")
+            # 保持默认值0%
 
     def _create_grid_levels(self):
         """创建所有网格价格层级的初始状态"""
@@ -416,7 +440,15 @@ class GridStrategy:
         level.total_profit += profit_usdt
         level.trade_count += 1
 
-        print(f"✅ 网格 {level.id} 完成交易，利润: {profit_usdt:.4f} USDT ({profit_record.profit_percentage:.2f}%)")
+        # 根据利润正负显示不同的图标和颜色提示
+        if profit_usdt >= 0:
+            status_icon = "✅"
+            profit_desc = "盈利"
+        else:
+            status_icon = "📉"
+            profit_desc = "亏损"
+
+        print(f"{status_icon} 网格 {level.id} 完成交易，{profit_desc}: {profit_usdt:.4f} USDT ({profit_record.profit_percentage:.2f}%)")
 
         # 保存利润记录
         await self._save_profit_records()
@@ -609,17 +641,32 @@ class GridStrategy:
             self.price_to_id = {}
 
     def _calculate_grid_profit(self, level: GridLevelState, close_trade: Trade) -> Decimal:
-        """计算单个网格的利润"""
+        """
+        计算单个网格的利润
+
+        做空策略说明：
+        - 开仓：在高价卖出（level.price）
+        - 平仓：在低价买入（close_trade.price）
+        - 盈利条件：平仓价格 < 开仓价格（价格下跌）
+        - 亏损条件：平仓价格 > 开仓价格（价格上涨）
+
+        这是正确的做空逻辑，负利润表示价格上涨导致的亏损
+        """
         if self.side == "long":
             # 做多：买入价格低，卖出价格高，利润 = (卖出价 - 买入价) * 数量
             profit = (close_trade.price - level.price) * close_trade.amount
         else:
             # 做空：卖出价格高，买入价格低，利润 = (卖出价 - 买入价) * 数量
+            # 当 level.price > close_trade.price 时盈利（价格下跌）
+            # 当 level.price < close_trade.price 时亏损（价格上涨）
             profit = (level.price - close_trade.price) * close_trade.amount
 
-        # 扣除手续费（假设手续费率0.1%）
-        fee_rate = Decimal('0.001')
-        total_fee = (level.price * close_trade.amount + close_trade.price * close_trade.amount) * fee_rate
+        # 扣除手续费（使用实际交易所费率）
+        # 开仓和平仓都可能产生手续费，这里使用taker费率（因为我们使用限价单但可能立即成交）
+        # 对于USDC期货，通常maker和taker费率都是0%
+        open_fee = level.price * close_trade.amount * self.taker_fee_rate
+        close_fee = close_trade.price * close_trade.amount * self.taker_fee_rate
+        total_fee = open_fee + close_fee
 
         return profit - total_fee
 

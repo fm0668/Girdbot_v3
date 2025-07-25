@@ -34,6 +34,21 @@ class ExchangeInterface:
         """Load markets and other initialization tasks."""
         self.markets = await self.exchange.fetch_markets()
 
+    async def fetch_trading_fees(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+        """获取交易手续费信息"""
+        try:
+            symbol = symbol or self.config.pair
+            # 尝试获取特定交易对的手续费
+            fees = await self.exchange.fetch_trading_fees([symbol])
+            return fees.get(symbol, {})
+        except Exception as e:
+            print(f"获取手续费信息失败：{e}")
+            # 返回默认值
+            return {
+                'maker': 0.0,  # USDC期货通常maker费率为0
+                'taker': 0.0   # USDC期货通常taker费率也为0
+            }
+
     async def set_leverage_and_margin_mode(self):
         """为交易对设置杠杆和保证金模式"""
         try:
@@ -42,9 +57,13 @@ class ExchangeInterface:
             # 设置持仓模式为双向持仓
             try:
                 await self.exchange.set_position_mode(True)  # True = 双向持仓模式
-                print("持仓模式已设置为双向持仓")
+                print("✅ 持仓模式已设置为双向持仓")
             except Exception as e:
-                print(f"持仓模式设置失败（可能已经设置）：{e}")
+                # 如果是已经设置的错误，就不显示错误信息
+                if "-4059" in str(e) or "No need to change position side" in str(e):
+                    print("✅ 持仓模式已为双向持仓（无需更改）")
+                else:
+                    print(f"❌ 持仓模式设置失败：{e}")
 
             # CCXT统一方法设置保证金模式为 ISOLATED (逐仓)
             await self.exchange.set_margin_mode('ISOLATED', self.config.pair)
