@@ -1,0 +1,27 @@
+{
+    "name": "HedgeGridBot-BTC",
+    "exchange": "binance",
+    "sandbox_mode": true,
+
+    "long_api_key": "your-long-account-api-key",
+    "long_api_secret": "your-long-account-api-secret",
+    
+    "short_api_key": "your-short-account-api-key",
+    "short_api_secret": "your-short-account-api-secret",
+
+    "market_type": "future",
+    "pair": "BTC/USDT",
+    "leverage": 10,
+    "lower_price": "60000",
+    "upper_price": "70000",
+    "grids": 10,
+    "order_amount_usdt": 100,
+    "max_position_count": 5,
+
+    "hedge_mode": true,
+    "max_imbalance_ratio": 0.1,
+    "sync_tolerance_seconds": 30,
+
+    "frontend": false,
+    "frontend_host": "localhost:8080"
+}
