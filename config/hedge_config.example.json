@@ -1,27 +1,45 @@
 {
-    "name": "HedgeGridBot-BTC",
-    "exchange": "binance",
-    "sandbox_mode": true,
+    "_comment": "对冲网格机器人实盘配置文件",
+    "_instructions": "请在.env文件中设置API密钥，然后修改以下参数",
 
-    "long_api_key": "your-long-account-api-key",
-    "long_api_secret": "your-long-account-api-secret",
-    
-    "short_api_key": "your-short-account-api-key",
-    "short_api_secret": "your-short-account-api-secret",
+    "name": "HedgeGridBot-BTC-Live",
+    "exchange": "binance",
+    "sandbox_mode": false,
+
+    "long_api_key": "${LONG_API_KEY}",
+    "long_api_secret": "${LONG_API_SECRET}",
+
+    "short_api_key": "${SHORT_API_KEY}",
+    "short_api_secret": "${SHORT_API_SECRET}",
 
     "market_type": "future",
     "pair": "BTC/USDT",
-    "leverage": 10,
-    "lower_price": "60000",
-    "upper_price": "70000",
-    "grids": 10,
-    "order_amount_usdt": 100,
-    "max_position_count": 5,
+    "leverage": 5,
+    "lower_price": "65000",
+    "upper_price": "75000",
+    "grids": 20,
+    "order_amount_usdt": 50,
+    "max_position_count": 10,
 
     "hedge_mode": true,
-    "max_imbalance_ratio": 0.1,
-    "sync_tolerance_seconds": 30,
+    "max_imbalance_ratio": 0.05,
+    "sync_tolerance_seconds": 15,
 
     "frontend": false,
-    "frontend_host": "localhost:8080"
+    "frontend_host": "localhost:8080",
+
+    "_risk_settings": {
+        "_comment": "风险控制参数说明",
+        "leverage": "建议使用较低杠杆(3-10倍)降低风险",
+        "order_amount_usdt": "单次订单金额，建议从小金额开始测试",
+        "max_imbalance_ratio": "最大不平衡比例，越小越保守",
+        "sync_tolerance_seconds": "同步容忍时间，越小同步越及时"
+    },
+
+    "_trading_params": {
+        "_comment": "交易参数说明",
+        "price_range": "价格区间应该覆盖预期的波动范围",
+        "grids": "网格数量，更多网格意味着更密集的交易",
+        "position_limit": "最大持仓数量限制，控制风险敞口"
+    }
 }

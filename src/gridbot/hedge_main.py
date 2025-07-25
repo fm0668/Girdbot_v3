@@ -6,17 +6,50 @@
 import argparse
 import asyncio
 import json
+import os
+import re
 import sys
 from pathlib import Path
 from .models import DualAccountConfig
 from .hedge_bot import HedgeGridBot
 
+def load_env_variables():
+    """加载环境变量"""
+    from dotenv import load_dotenv
+    load_dotenv()
+
+def substitute_env_variables(config_str: str) -> str:
+    """替换配置文件中的环境变量"""
+    def replace_var(match):
+        var_name = match.group(1)
+        env_value = os.getenv(var_name)
+        if env_value is None:
+            print(f"⚠️ 环境变量 {var_name} 未设置")
+            return match.group(0)  # 保持原样
+        return env_value
+
+    # 替换 ${VAR_NAME} 格式的环境变量
+    return re.sub(r'\$\{([^}]+)\}', replace_var, config_str)
+
 def load_dual_config(config_path: str) -> DualAccountConfig:
     """加载双账户配置"""
     try:
+        # 加载环境变量
+        load_env_variables()
+
+        # 读取配置文件
         with open(config_path, 'r') as f:
-            config_data = json.load(f)
-        
+            config_str = f.read()
+
+        # 替换环境变量
+        config_str = substitute_env_variables(config_str)
+
+        # 解析JSON
+        config_data = json.loads(config_str)
+
+        # 移除注释字段
+        config_data = {k: v for k, v in config_data.items() if not k.startswith('_')}
+
         return DualAccountConfig(**config_data)
     except Exception as e:
         print(f"❌ 加载配置文件失败: {e}")
