@@ -38,16 +38,51 @@ class ExchangeInterface:
         """获取交易手续费信息"""
         try:
             symbol = symbol or self.config.pair
-            # 尝试获取特定交易对的手续费
-            fees = await self.exchange.fetch_trading_fees([symbol])
-            return fees.get(symbol, {})
+
+            # 方法1: 尝试获取单个交易对的手续费
+            try:
+                fee_info = await self.exchange.fetch_trading_fee(symbol)
+                if fee_info and 'maker' in fee_info and 'taker' in fee_info:
+                    return {
+                        'maker': fee_info['maker'],
+                        'taker': fee_info['taker']
+                    }
+            except Exception as e1:
+                print(f"方法1失败: {e1}")
+
+            # 方法2: 尝试从市场信息中获取手续费
+            try:
+                await self.exchange.load_markets()
+                market = self.exchange.market(symbol)
+                if market and 'maker' in market and 'taker' in market:
+                    return {
+                        'maker': market['maker'],
+                        'taker': market['taker']
+                    }
+            except Exception as e2:
+                print(f"方法2失败: {e2}")
+
+            # 方法3: 尝试获取所有交易对的手续费
+            try:
+                all_fees = await self.exchange.fetch_trading_fees()
+                if all_fees and symbol in all_fees:
+                    fee_data = all_fees[symbol]
+                    return {
+                        'maker': fee_data.get('maker', 0.0),
+                        'taker': fee_data.get('taker', 0.0)
+                    }
+            except Exception as e3:
+                print(f"方法3失败: {e3}")
+
         except Exception as e:
             print(f"获取手续费信息失败：{e}")
-            # 返回默认值
-            return {
-                'maker': 0.0,  # USDC期货通常maker费率为0
-                'taker': 0.0   # USDC期货通常taker费率也为0
-            }
+
+        # 返回USDC期货的默认值（通常为0%）
+        print("使用默认手续费率：USDC期货通常为0%")
+        return {
+            'maker': 0.0,  # USDC期货通常maker费率为0
+            'taker': 0.0   # USDC期货通常taker费率也为0
+        }
 
     async def set_leverage_and_margin_mode(self):
         """为交易对设置杠杆和保证金模式"""
